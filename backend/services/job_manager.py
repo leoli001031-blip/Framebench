@@ -132,6 +132,7 @@ class JobManager:
                 job.total_shots = len(shots)
                 job.duration_sec = video_duration
                 job.progress = 0.3
+                job.error_message = None
                 await db.commit()
 
             # Phase 2: AI Analysis (vision-based via Moonshot API)
@@ -139,6 +140,7 @@ class JobManager:
                 result = await db.execute(select(Job).where(Job.id == job_id))
                 job = result.scalar_one()
                 job.status = "analyzing"
+                job.error_message = None
                 await db.commit()
 
             analysis_service = AnalysisService()

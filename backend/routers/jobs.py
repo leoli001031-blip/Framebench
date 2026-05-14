@@ -1,8 +1,8 @@
 import asyncio
-import contextlib
 import json
 import os
 import shutil
+import traceback
 import uuid
 from typing import Optional
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
@@ -26,6 +26,7 @@ router = APIRouter(prefix="/api")
 
 SECRET_SETTING_KEYS = {"analysis_api_key", "storyboard_api_key", "moonshot_api_key"}
 MASK_PREFIX = "••••••••"
+_storyboard_generation_tasks: set[asyncio.Task] = set()
 
 
 def _read_report(report_path: str) -> str:
@@ -235,6 +236,10 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
     async def collect_and_generate():
         """Collect references from DB and run AI generation, pushing progress to queue."""
         try:
+            print(
+                f"Storyboard generation started: refs={len(req.reference_job_ids)}, "
+                f"target_duration={req.target_duration_sec or 'unset'}"
+            )
             # Collect reference analyses
             references = []
             async with AsyncSessionLocal() as db:
@@ -301,29 +306,31 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
                 await db.commit()
 
             result["id"] = sb_id
+            print(
+                f"Storyboard generation saved: id={sb_id}, "
+                f"title={result.get('title', '')[:80]}, shots={len(result.get('shots', []))}"
+            )
             await queue.put({"event": "complete", "data": {"result": result}})
         except RuntimeError as e:
+            print(f"Storyboard generation failed: {e}")
             await queue.put({"event": "error", "data": {"message": f"AI generation failed: {str(e)[:300]}"}})
         except Exception as e:
+            traceback.print_exc()
             await queue.put({"event": "error", "data": {"message": str(e)[:300]}})
         finally:
             await queue.put(None)  # Sentinel to close the stream
 
     # Start collection + generation in background
     generation_task = asyncio.create_task(collect_and_generate())
+    _storyboard_generation_tasks.add(generation_task)
+    generation_task.add_done_callback(_storyboard_generation_tasks.discard)
 
     async def event_generator():
-        try:
-            while True:
-                event = await queue.get()
-                if event is None:
-                    break
-                yield f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
-        finally:
-            if not generation_task.done():
-                generation_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await generation_task
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),

@@ -108,6 +108,38 @@ export async function generateStoryboardStream(
 
   const decoder = new TextDecoder()
   let buffer = ""
+  let settled = false
+
+  const handleEventBlock = (block: string) => {
+    let currentEvent = ""
+    const dataLines: string[] = []
+
+    for (const rawLine of block.split(/\r?\n/)) {
+      const line = rawLine.trimEnd()
+      if (line.startsWith("event:")) {
+        currentEvent = line.slice(6).trim()
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart())
+      }
+    }
+
+    if (!currentEvent || dataLines.length === 0) return
+
+    try {
+      const data = JSON.parse(dataLines.join("\n"))
+      if (currentEvent === "progress") {
+        callbacks.onProgress(data.message)
+      } else if (currentEvent === "complete") {
+        settled = true
+        callbacks.onComplete(data.result)
+      } else if (currentEvent === "error") {
+        settled = true
+        callbacks.onError(data.message)
+      }
+    } catch {
+      // Ignore malformed SSE chunks; the final close guard will surface missing results.
+    }
+  }
 
   try {
     while (true) {
@@ -115,27 +147,19 @@ export async function generateStoryboardStream(
       if (done) break
 
       buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split("\n")
-      buffer = lines.pop() || ""
 
-      let currentEvent = ""
-      for (const line of lines) {
-        if (line.startsWith("event: ")) {
-          currentEvent = line.slice(7).trim()
-        } else if (line.startsWith("data: ")) {
-          const dataStr = line.slice(6)
-          try {
-            const data = JSON.parse(dataStr)
-            if (currentEvent === "progress") {
-              callbacks.onProgress(data.message)
-            } else if (currentEvent === "complete") {
-              callbacks.onComplete(data.result)
-            } else if (currentEvent === "error") {
-              callbacks.onError(data.message)
-            }
-          } catch { /* skip malformed JSON */ }
-        }
+      let boundary = buffer.indexOf("\n\n")
+      while (boundary !== -1) {
+        const block = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        handleEventBlock(block)
+        boundary = buffer.indexOf("\n\n")
       }
+    }
+    buffer += decoder.decode()
+    if (buffer.trim()) handleEventBlock(buffer)
+    if (!settled && !signal?.aborted) {
+      callbacks.onError("分镜生成连接已结束，但没有收到完成结果；请稍后查看历史记录或重试。")
     }
   } catch (e) {
     if (e instanceof DOMException && e.name === "AbortError") return
