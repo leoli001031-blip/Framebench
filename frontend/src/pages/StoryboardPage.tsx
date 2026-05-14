@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from "react"
-import { listJobs, generateStoryboardStream, listStoryboards, getStoryboard, deleteStoryboard } from "@/lib/api"
+import { listJobs, generateStoryboardStream, listStoryboards, listStoryboardGenerations, getStoryboard, deleteStoryboard } from "@/lib/api"
 import StatusBean from "@/components/StatusBean"
 import JobCard from "@/components/JobCard"
 import Logo from "@/components/Logo"
 import { categorySort, downloadFile } from "@/lib/utils"
-import type { JobInfo, StoryboardResult, StoryboardHistoryItem, StoryboardDetail } from "@/types"
+import type { JobInfo, StoryboardResult, StoryboardHistoryItem, StoryboardDetail, StoryboardGenerationTask } from "@/types"
+
+const ACTIVE_STORYBOARD_TASK_ID_KEY = "storyboard_active_task_id"
 
 export default function StoryboardPage() {
   const [jobs, setJobs] = useState<JobInfo[]>([])
@@ -20,7 +22,10 @@ export default function StoryboardPage() {
   const [history, setHistory] = useState<StoryboardHistoryItem[]>([])
   const [historyLoading, setHistoryLoading] = useState(false)
   const [showAllHistory, setShowAllHistory] = useState(false)
+  const [generationTasks, setGenerationTasks] = useState<StoryboardGenerationTask[]>([])
+  const [activeTaskId, setActiveTaskId] = useState(() => localStorage.getItem(ACTIVE_STORYBOARD_TASK_ID_KEY) || "")
   const generationAbortRef = useRef<AbortController | null>(null)
+  const autoOpenedTaskRef = useRef<string | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -44,12 +49,52 @@ export default function StoryboardPage() {
       setError(e instanceof Error ? e.message : "分镜历史加载失败")
     }
   }, [])
+
+  const loadGenerationTasks = useCallback(async () => {
+    try {
+      const tasks = await listStoryboardGenerations()
+      setGenerationTasks(tasks)
+
+      const storedTaskId = localStorage.getItem(ACTIVE_STORYBOARD_TASK_ID_KEY)
+      const activeTask = storedTaskId ? tasks.find((task) => task.id === storedTaskId) : undefined
+      if (activeTask?.status === "completed" && activeTask.storyboard_id && autoOpenedTaskRef.current !== activeTask.id) {
+        autoOpenedTaskRef.current = activeTask.id
+        localStorage.removeItem(ACTIVE_STORYBOARD_TASK_ID_KEY)
+        setActiveTaskId("")
+        const detail: StoryboardDetail = await getStoryboard(activeTask.storyboard_id)
+        setResult({
+          title: detail.title,
+          total_duration_sec: detail.total_duration_sec,
+          shots: detail.shots,
+          full_notes: detail.full_notes,
+        })
+        setBrief(detail.brief)
+        setTargetDur(detail.total_duration_sec?.toString() || "")
+        setSelectedIds(new Set(detail.reference_job_ids))
+        await loadHistory()
+        window.scrollTo({ top: 0, behavior: "smooth" })
+      } else if (activeTask?.status === "failed") {
+        localStorage.removeItem(ACTIVE_STORYBOARD_TASK_ID_KEY)
+        setActiveTaskId("")
+      }
+    } catch (e) {
+      console.error("Failed to load storyboard generations", e)
+    }
+  }, [loadHistory])
+
   useEffect(() => {
     void Promise.resolve().then(async () => {
       await load()
       await loadHistory()
+      await loadGenerationTasks()
     })
-  }, [load, loadHistory])
+  }, [load, loadHistory, loadGenerationTasks])
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void loadGenerationTasks()
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [loadGenerationTasks])
   useEffect(() => () => generationAbortRef.current?.abort(), [])
   useEffect(() => { localStorage.setItem("storyboard_brief", brief) }, [brief])
   useEffect(() => { localStorage.setItem("storyboard_target_dur", targetDur) }, [targetDur])
@@ -57,6 +102,12 @@ export default function StoryboardPage() {
 
   const referenceJobs = jobs.filter((j) => j.status === "completed")
   const visibleHistory = showAllHistory ? history : history.slice(0, 3)
+  const activeGenerationTasks = generationTasks.filter((task) => isStoryboardTaskActive(task.status))
+  const visibleGenerationTasks = (
+    activeGenerationTasks.length > 0
+      ? activeGenerationTasks
+      : generationTasks.filter((task) => task.status === "failed" || task.id === activeTaskId).slice(0, 2)
+  )
 
   const toggleSelect = (id: string) => {
     setSelectedIds((prev) => {
@@ -100,8 +151,33 @@ export default function StoryboardPage() {
     generationAbortRef.current = controller
     const parsed = parseFloat(targetDur)
     const dur = !isNaN(parsed) ? Math.round(parsed) : undefined
+    const taskId = createStoryboardTaskId()
+    const startedAt = new Date().toISOString()
+    setActiveTaskId(taskId)
+    localStorage.setItem(ACTIVE_STORYBOARD_TASK_ID_KEY, taskId)
+    setGenerationTasks((prev) => [
+      {
+        id: taskId,
+        brief,
+        reference_job_ids: [...selectedIds],
+        target_duration_sec: dur ?? null,
+        status: "queued",
+        progress: 0.02,
+        message: "已加入生成队列",
+        storyboard_id: null,
+        error_message: null,
+        created_at: startedAt,
+        updated_at: startedAt,
+      },
+      ...prev.filter((task) => task.id !== taskId),
+    ])
 
     await generateStoryboardStream(brief, [...selectedIds], dur, {
+      onStarted: (task) => {
+        setActiveTaskId(task.id)
+        localStorage.setItem(ACTIVE_STORYBOARD_TASK_ID_KEY, task.id)
+        setGenerationTasks((prev) => [task, ...prev.filter((item) => item.id !== task.id)])
+      },
       onProgress: (msg) => {
         if (!controller.signal.aborted) setGenerationProgress(msg)
       },
@@ -111,7 +187,10 @@ export default function StoryboardPage() {
         setGenerating(false)
         setGenerationProgress("")
         generationAbortRef.current = null
+        setActiveTaskId("")
+        localStorage.removeItem(ACTIVE_STORYBOARD_TASK_ID_KEY)
         loadHistory()
+        loadGenerationTasks()
         localStorage.removeItem("storyboard_brief")
         localStorage.removeItem("storyboard_target_dur")
         localStorage.removeItem("storyboard_selected_ids")
@@ -122,8 +201,11 @@ export default function StoryboardPage() {
         setGenerating(false)
         setGenerationProgress("")
         generationAbortRef.current = null
+        setActiveTaskId("")
+        localStorage.removeItem(ACTIVE_STORYBOARD_TASK_ID_KEY)
+        loadGenerationTasks()
       },
-    }, controller.signal)
+    }, controller.signal, taskId)
   }
 
   const handleLoadHistory = async (id: string) => {
@@ -149,6 +231,8 @@ export default function StoryboardPage() {
     generationAbortRef.current = null
     setGenerating(false)
     setGenerationProgress("")
+    setActiveTaskId("")
+    localStorage.removeItem(ACTIVE_STORYBOARD_TASK_ID_KEY)
     localStorage.removeItem("storyboard_brief")
     localStorage.removeItem("storyboard_target_dur")
     localStorage.removeItem("storyboard_selected_ids")
@@ -292,10 +376,63 @@ export default function StoryboardPage() {
             </div>
           </div>
         </div>
-      )}
+	      )}
 
-      {/* Archives Section - Moved Up (Visible only when no result is shown) */}
-      {!result && history.length > 0 && (
+	      {!result && visibleGenerationTasks.length > 0 && (
+	        <div className="mb-16 px-1 animate-in fade-in slide-in-from-top-2 duration-500">
+	          <div className="flex items-center justify-between mb-5">
+	            <div className="flex items-center gap-4">
+	              <h3 className="text-[10px] font-black text-muted/30 uppercase tracking-[0.45em]">生成队列</h3>
+	              <div className="h-px w-16 bg-line/10" />
+	            </div>
+	            <span className="text-[10px] text-muted/20 font-black uppercase tracking-widest">
+	              {activeGenerationTasks.length > 0 ? `${activeGenerationTasks.length} 个任务运行中` : "最近任务"}
+	            </span>
+	          </div>
+	          <div className="space-y-3">
+	            {visibleGenerationTasks.map((task) => {
+	              const progressPct = Math.max(4, Math.min(100, Math.round((task.progress || 0) * 100)))
+	              const isActive = isStoryboardTaskActive(task.status)
+	              const isFailed = task.status === "failed"
+	              return (
+	                <div key={task.id} className="rounded-2xl bg-surface/35 border border-line/5 px-5 py-4">
+	                  <div className="flex items-start justify-between gap-5">
+	                    <div className="min-w-0 flex-1">
+	                      <div className="flex items-center gap-3 mb-2">
+	                        <span className={`w-1.5 h-1.5 rounded-full ${isFailed ? "bg-clay" : isActive ? "bg-primary animate-pulse" : "bg-sage"}`} />
+	                        <span className="text-[10px] font-black text-muted/30 uppercase tracking-[0.25em]">
+	                          {storyboardTaskStatusLabel(task.status)}
+	                        </span>
+	                      </div>
+	                      <p className="text-sm text-ink/70 font-serif italic truncate">{task.brief}</p>
+	                      <p className={`mt-1 text-[10px] font-bold tracking-wider ${isFailed ? "text-clay/80" : "text-muted/40"}`}>
+	                        {task.error_message || task.message || "正在准备"}
+	                      </p>
+	                    </div>
+	                    {task.status === "completed" && task.storyboard_id && (
+	                      <button
+	                        onClick={() => { handleLoadHistory(task.storyboard_id!); window.scrollTo({ top: 0, behavior: "smooth" }) }}
+	                        className="shrink-0 text-[10px] text-primary/60 hover:text-primary font-black uppercase tracking-[0.2em] transition-colors"
+	                      >
+	                        查看
+	                      </button>
+	                    )}
+	                  </div>
+	                  <div className="mt-4 h-1.5 rounded-full bg-paper overflow-hidden">
+	                    <div
+	                      className={`h-full rounded-full transition-all duration-700 ${isFailed ? "bg-clay/70" : "bg-primary"}`}
+	                      style={{ width: `${isFailed ? 100 : progressPct}%` }}
+	                    />
+	                  </div>
+	                </div>
+	              )
+	            })}
+	          </div>
+	        </div>
+	      )}
+
+	      {/* Archives Section - Moved Up (Visible only when no result is shown) */}
+	      {!result && history.length > 0 && (
         <div className="mb-24 animate-in fade-in duration-1000 px-1">
           <div className="flex items-center justify-between mb-10">
             <div className="flex items-center gap-6">
@@ -454,5 +591,30 @@ export default function StoryboardPage() {
         )}
       </div>
     </div>
-  )
+	  )
+	}
+
+function createStoryboardTaskId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID()
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (char) => {
+    const value = Math.floor(Math.random() * 16)
+    const next = char === "x" ? value : (value & 0x3) | 0x8
+    return next.toString(16)
+  })
+}
+
+function isStoryboardTaskActive(status: string): boolean {
+  return ["queued", "collecting", "generating", "saving"].includes(status)
+}
+
+function storyboardTaskStatusLabel(status: string): string {
+  if (status === "queued") return "排队中"
+  if (status === "collecting") return "整理参考"
+  if (status === "generating") return "生成中"
+  if (status === "saving") return "保存中"
+  if (status === "completed") return "已完成"
+  if (status === "failed") return "失败"
+  return status
 }

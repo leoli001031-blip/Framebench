@@ -72,6 +72,7 @@ class GenerateStoryboardRequest(BaseModel):
     brief: str = Field(..., min_length=1, max_length=5000)
     reference_job_ids: list[str] = Field(..., min_length=1, max_length=20)
     target_duration_sec: Optional[int] = None
+    client_task_id: Optional[str] = Field(default=None, min_length=1, max_length=80)
 
 
 class StoryboardShot(BaseModel):
@@ -143,6 +144,30 @@ class StoryboardDetailResponse(BaseModel):
     reference_job_ids: list[str] = []
     shots: list[StoryboardShotDetail] = []
     created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+    @field_validator("reference_job_ids", mode="before")
+    @classmethod
+    def parse_reference_ids(cls, v):
+        if isinstance(v, str):
+            import json
+            return json.loads(v)
+        return v
+
+
+class StoryboardGenerationTaskResponse(BaseModel):
+    id: str
+    brief: str
+    reference_job_ids: list[str] = []
+    target_duration_sec: Optional[int] = None
+    status: str
+    progress: float = 0.0
+    message: Optional[str] = None
+    storyboard_id: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
 
     model_config = {"from_attributes": True}
 

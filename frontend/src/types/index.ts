@@ -77,6 +77,20 @@ export interface StoryboardDetail extends StoryboardResult {
   created_at: string
 }
 
+export interface StoryboardGenerationTask {
+  id: string
+  brief: string
+  reference_job_ids: string[]
+  target_duration_sec: number | null
+  status: "queued" | "collecting" | "generating" | "saving" | "completed" | "failed" | string
+  progress: number
+  message: string | null
+  storyboard_id: string | null
+  error_message: string | null
+  created_at: string
+  updated_at: string
+}
+
 export interface CategoryList {
   categories: string[]
 }

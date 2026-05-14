@@ -111,6 +111,22 @@ class StoryboardShot(Base):
     storyboard = relationship("Storyboard", back_populates="shots")
 
 
+class StoryboardGenerationTask(Base):
+    __tablename__ = "storyboard_generation_tasks"
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    brief = Column(Text, nullable=False)
+    reference_job_ids = Column(Text, nullable=False)
+    target_duration_sec = Column(Integer, nullable=True)
+    status = Column(String, nullable=False, default="queued")
+    progress = Column(Float, default=0.0)
+    message = Column(String, nullable=True)
+    storyboard_id = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_now)
+    updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+
 class SystemSetting(Base):
     __tablename__ = "system_settings"
 

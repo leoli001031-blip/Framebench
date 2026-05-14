@@ -22,13 +22,23 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
 
     # Reset any stuck jobs (analyzing/preprocessing -> failed)
-    from backend.models import Job, _now
+    from backend.models import Job, StoryboardGenerationTask, _now
     from sqlalchemy import update
     async with engine.begin() as conn:
         await conn.execute(
             update(Job)
             .where(Job.status.in_(["preprocessing", "preprocessing_done", "analyzing", "cancelling"]))
             .values(status="failed", error_message=INTERRUPTED_JOB_MESSAGE, updated_at=_now())
+        )
+        await conn.execute(
+            update(StoryboardGenerationTask)
+            .where(StoryboardGenerationTask.status.in_(["queued", "collecting", "generating", "saving"]))
+            .values(
+                status="failed",
+                message="上一次分镜生成在应用或后端退出时中断，请重新生成。",
+                error_message="上一次分镜生成在应用或后端退出时中断，请重新生成。",
+                updated_at=_now(),
+            )
         )
 
     yield

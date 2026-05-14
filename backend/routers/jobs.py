@@ -10,14 +10,17 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from backend.database import get_db
-from backend.models import Job, Shot, Dimension, TranscriptSegment, Storyboard, StoryboardShot, SystemSetting
+from backend.database import get_db, AsyncSessionLocal
+from backend.models import (
+    Job, Shot, Dimension, TranscriptSegment, Storyboard, StoryboardShot,
+    StoryboardGenerationTask, SystemSetting,
+)
 from backend.schemas import (
     JobResponse, JobDetailResponse, JobWithShotsResponse,
     UploadResponse, StartResponse, DeleteResponse,
     UpdateJobRequest, GenerateStoryboardRequest, StoryboardResponse,
     CategoryListResponse, StoryboardHistoryItem, StoryboardDetailResponse,
-    SystemSettingResponse, UpdateSettingRequest,
+    StoryboardGenerationTaskResponse, SystemSettingResponse, UpdateSettingRequest,
 )
 from backend.config import JOBS_DIR, MAX_VIDEO_SIZE_MB
 from backend.services.job_manager import job_manager
@@ -64,6 +67,53 @@ def _serialize_setting(setting: SystemSetting) -> SystemSettingResponse:
         is_secret=is_secret,
         updated_at=setting.updated_at,
     )
+
+
+def _serialize_storyboard_task(task: StoryboardGenerationTask) -> StoryboardGenerationTaskResponse:
+    return StoryboardGenerationTaskResponse(
+        id=task.id,
+        brief=task.brief,
+        reference_job_ids=json.loads(task.reference_job_ids or "[]"),
+        target_duration_sec=task.target_duration_sec,
+        status=task.status,
+        progress=task.progress or 0.0,
+        message=task.message,
+        storyboard_id=task.storyboard_id,
+        error_message=task.error_message,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
+def _safe_client_task_id(client_task_id: Optional[str]) -> str:
+    if client_task_id:
+        try:
+            return str(uuid.UUID(client_task_id))
+        except ValueError:
+            pass
+    return str(uuid.uuid4())
+
+
+def _storyboard_progress_for_message(message: str) -> tuple[str, float]:
+    if "解析" in message:
+        return "saving", 0.86
+    if "调用 AI" in message or "生成分镜" in message:
+        return "generating", 0.58
+    if "已收集" in message:
+        return "collecting", 0.28
+    if "收集" in message:
+        return "collecting", 0.12
+    return "generating", 0.45
+
+
+async def _update_storyboard_task(task_id: str, **fields):
+    async with AsyncSessionLocal() as db:
+        task = await db.get(StoryboardGenerationTask, task_id)
+        if not task:
+            return
+        for key, value in fields.items():
+            setattr(task, key, value)
+        await db.commit()
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -228,10 +278,47 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
     if not req.reference_job_ids:
         raise HTTPException(400, "At least one reference job is required")
 
-    from backend.database import AsyncSessionLocal
-    from backend.services.storyboard_generator import generate_storyboard
+    from backend.services.storyboard_generator import generate_storyboard as run_storyboard_generation
 
     queue: asyncio.Queue = asyncio.Queue()
+    task_id = _safe_client_task_id(req.client_task_id)
+    async with AsyncSessionLocal() as db:
+        if await db.get(StoryboardGenerationTask, task_id):
+            task_id = str(uuid.uuid4())
+        task = StoryboardGenerationTask(
+            id=task_id,
+            brief=req.brief,
+            reference_job_ids=json.dumps(req.reference_job_ids),
+            target_duration_sec=req.target_duration_sec,
+            status="queued",
+            progress=0.02,
+            message="已加入生成队列",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        await queue.put({
+            "event": "started",
+            "data": {"task": _serialize_storyboard_task(task).model_dump(mode="json")},
+        })
+
+    async def publish_progress(message: str, status: str, progress: float):
+        await _update_storyboard_task(
+            task_id,
+            status=status,
+            progress=progress,
+            message=message,
+            error_message=None,
+        )
+        await queue.put({
+            "event": "progress",
+            "data": {
+                "task_id": task_id,
+                "status": status,
+                "progress": progress,
+                "message": message,
+            },
+        })
 
     async def collect_and_generate():
         """Collect references from DB and run AI generation, pushing progress to queue."""
@@ -240,6 +327,7 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
                 f"Storyboard generation started: refs={len(req.reference_job_ids)}, "
                 f"target_duration={req.target_duration_sec or 'unset'}"
             )
+            await publish_progress("正在读取参考素材…", "collecting", 0.08)
             # Collect reference analyses
             references = []
             async with AsyncSessionLocal() as db:
@@ -249,7 +337,14 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
                     )
                     job = result.scalar_one_or_none()
                     if not job:
-                        await queue.put({"event": "error", "data": {"message": f"Reference job {jid} not found"}})
+                        message = f"Reference job {jid} not found"
+                        await _update_storyboard_task(
+                            task_id,
+                            status="failed",
+                            message=message,
+                            error_message=message,
+                        )
+                        await queue.put({"event": "error", "data": {"task_id": task_id, "message": message}})
                         return
 
                     shot_data = []
@@ -273,14 +368,16 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
                     })
 
             async def on_progress(msg: str):
-                await queue.put({"event": "progress", "data": {"message": msg}})
+                status, progress = _storyboard_progress_for_message(msg)
+                await publish_progress(msg, status, progress)
 
-            result = await generate_storyboard(
+            result = await run_storyboard_generation(
                 req.brief, references, req.target_duration_sec,
                 progress_callback=on_progress,
             )
 
             # Save to history
+            await publish_progress("正在保存分镜脚本…", "saving", 0.94)
             sb_id = str(uuid.uuid4())
             async with AsyncSessionLocal() as db:
                 sb = Storyboard(
@@ -306,17 +403,39 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
                 await db.commit()
 
             result["id"] = sb_id
+            await _update_storyboard_task(
+                task_id,
+                status="completed",
+                progress=1.0,
+                message="分镜脚本已保存",
+                storyboard_id=sb_id,
+                error_message=None,
+            )
             print(
                 f"Storyboard generation saved: id={sb_id}, "
                 f"title={result.get('title', '')[:80]}, shots={len(result.get('shots', []))}"
             )
-            await queue.put({"event": "complete", "data": {"result": result}})
+            await queue.put({"event": "complete", "data": {"task_id": task_id, "result": result}})
         except RuntimeError as e:
+            message = f"AI generation failed: {str(e)[:300]}"
             print(f"Storyboard generation failed: {e}")
-            await queue.put({"event": "error", "data": {"message": f"AI generation failed: {str(e)[:300]}"}})
+            await _update_storyboard_task(
+                task_id,
+                status="failed",
+                message=message,
+                error_message=message,
+            )
+            await queue.put({"event": "error", "data": {"task_id": task_id, "message": message}})
         except Exception as e:
+            message = str(e)[:300]
             traceback.print_exc()
-            await queue.put({"event": "error", "data": {"message": str(e)[:300]}})
+            await _update_storyboard_task(
+                task_id,
+                status="failed",
+                message=message,
+                error_message=message,
+            )
+            await queue.put({"event": "error", "data": {"task_id": task_id, "message": message}})
         finally:
             await queue.put(None)  # Sentinel to close the stream
 
@@ -341,6 +460,16 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/storyboard-generations", response_model=list[StoryboardGenerationTaskResponse])
+async def list_storyboard_generations(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(StoryboardGenerationTask)
+        .order_by(StoryboardGenerationTask.created_at.desc())
+        .limit(20)
+    )
+    return [_serialize_storyboard_task(task) for task in result.scalars().all()]
 
 
 @router.get("/storyboards", response_model=list[StoryboardHistoryItem])

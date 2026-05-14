@@ -1,4 +1,4 @@
-import type { JobInfo, JobDetail, CategoryList, StoryboardResult, StoryboardHistoryItem, StoryboardDetail, SystemSettingResponse } from "@/types"
+import type { JobInfo, JobDetail, CategoryList, StoryboardResult, StoryboardHistoryItem, StoryboardDetail, StoryboardGenerationTask, SystemSettingResponse } from "@/types"
 import { getApiBase, withAuthHeaders, withAuthQuery } from "@/lib/runtime"
 
 const BASE = getApiBase()
@@ -76,6 +76,7 @@ export async function generateStoryboard(brief: string, referenceJobIds: string[
 }
 
 export interface StoryboardStreamCallbacks {
+  onStarted?: (task: StoryboardGenerationTask) => void
   onProgress: (message: string) => void
   onComplete: (result: StoryboardResult) => void
   onError: (message: string) => void
@@ -87,11 +88,17 @@ export async function generateStoryboardStream(
   targetDurationSec: number | undefined,
   callbacks: StoryboardStreamCallbacks,
   signal?: AbortSignal,
+  clientTaskId?: string,
 ): Promise<void> {
   const res = await apiFetch("/generate-storyboard", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ brief, reference_job_ids: referenceJobIds, target_duration_sec: targetDurationSec }),
+    body: JSON.stringify({
+      brief,
+      reference_job_ids: referenceJobIds,
+      target_duration_sec: targetDurationSec,
+      client_task_id: clientTaskId,
+    }),
     signal,
   })
 
@@ -127,7 +134,9 @@ export async function generateStoryboardStream(
 
     try {
       const data = JSON.parse(dataLines.join("\n"))
-      if (currentEvent === "progress") {
+      if (currentEvent === "started") {
+        callbacks.onStarted?.(data.task)
+      } else if (currentEvent === "progress") {
         callbacks.onProgress(data.message)
       } else if (currentEvent === "complete") {
         settled = true
@@ -182,6 +191,12 @@ export function getSSEUrl(jobId: string): string {
 export async function listStoryboards(): Promise<StoryboardHistoryItem[]> {
   const res = await apiFetch("/storyboards")
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "List storyboards failed")
+  return res.json()
+}
+
+export async function listStoryboardGenerations(): Promise<StoryboardGenerationTask[]> {
+  const res = await apiFetch("/storyboard-generations")
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "List storyboard generations failed")
   return res.json()
 }
 
