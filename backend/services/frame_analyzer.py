@@ -161,7 +161,8 @@ def compute_optical_flow(frame1_path: str, frame2_path: str) -> Optional[dict]:
 
 
 def _extract_dominant_colors(arr: np.ndarray, n_colors: int = 4) -> list[dict]:
-    q = (arr * 15).astype(np.uint8)
+    # Keep arithmetic outside uint8; NumPy 2 rejects multiplying uint8 by 256.
+    q = np.clip(arr * 15, 0, 15).astype(np.int32)
     indices = q[:, :, 0] * 256 + q[:, :, 1] * 16 + q[:, :, 2]
     counts = np.bincount(indices.flatten(), minlength=4096)
 
