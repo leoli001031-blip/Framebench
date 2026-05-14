@@ -1,0 +1,24 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.*
+film_master.db
+*.db
+*.sqlite
+*.sqlite3
+data/
+data/jobs/
+frontend/dist/
+frontend/backend-runtime/
+frontend/release/
+.runtime/
+.planning/
+.venv/
+venv/
+.DS_Store
+analysis.json
+shot_analysis*.json
+
+# Local browser/test output
+.playwright-mcp/
