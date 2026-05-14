@@ -22,6 +22,10 @@ It is built for creators who want to quickly upload a film clip, break it into s
 
 ![Storyboard workspace](docs/screenshots/04-storyboard.png)
 
+### Storyboard Script
+
+![Generated storyboard script](docs/screenshots/06-storyboard-script.png)
+
 ### Settings
 
 ![Local model and API settings](docs/screenshots/05-settings.png)
