@@ -1,7 +1,7 @@
 {
   "name": "framebench",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "A desktop workbench for film analysis, shot reference, and storyboard generation.",
   "author": "zc",
   "license": "MIT",

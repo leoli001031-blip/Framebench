@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import traceback
 import httpx
 from backend.config import JOBS_DIR
@@ -80,11 +81,18 @@ class JobManager:
         video_path = os.path.join(job_dir, "original.mp4")
 
         try:
+            await asyncio.to_thread(self._clean_generated_outputs, job_dir)
+
             # Phase 1: Preprocessing
             async with AsyncSessionLocal() as db:
                 result = await db.execute(select(Job).where(Job.id == job_id))
                 job = result.scalar_one()
                 job.status = "preprocessing"
+                job.progress = 0.0
+                job.total_shots = None
+                job.duration_sec = None
+                job.error_message = None
+                job.overview_text = None
                 # Clean up old shot/transcript data from previous run to avoid IntegrityError
                 shot_ids = (await db.execute(select(Shot.id).where(Shot.job_id == job_id))).scalars().all()
                 if shot_ids:
@@ -278,6 +286,16 @@ class JobManager:
             self._tasks.pop(job_id, None)
             self._subscribers.pop(job_id, None)
             self._cancel_requested.discard(job_id)
+
+    def _clean_generated_outputs(self, job_dir: str):
+        """Remove stale generated artifacts before retrying an existing job."""
+        shutil.rmtree(os.path.join(job_dir, "frames"), ignore_errors=True)
+        for name in ("shots.json", "audio_analysis.json", "audio.wav", "transcript.json", "report.md"):
+            path = os.path.join(job_dir, name)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
 
 job_manager = JobManager()

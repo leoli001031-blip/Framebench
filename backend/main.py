@@ -10,6 +10,9 @@ from backend.database import engine, Base
 from backend.config import JOBS_DIR, LOCAL_API_TOKEN, ensure_data_root
 
 
+INTERRUPTED_JOB_MESSAGE = "上一次分析在应用或后端退出时中断，请重新分析。若反复出现，请发送本机日志。"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_data_root()
@@ -25,7 +28,7 @@ async def lifespan(app: FastAPI):
         await conn.execute(
             update(Job)
             .where(Job.status.in_(["preprocessing", "preprocessing_done", "analyzing", "cancelling"]))
-            .values(status="failed", error_message="Server restarted during job", updated_at=_now())
+            .values(status="failed", error_message=INTERRUPTED_JOB_MESSAGE, updated_at=_now())
         )
 
     yield

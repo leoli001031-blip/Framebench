@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { useNavigate } from "react-router-dom"
 import { uploadVideo, listJobs, deleteJob, updateJob } from "@/lib/api"
 import StatusBean from "@/components/StatusBean"
@@ -14,6 +14,7 @@ export default function UploadPage() {
   const [loadError, setLoadError] = useState("")
   const [error, setError] = useState("")
   const [dragOver, setDragOver] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const navigate = useNavigate()
 
   const loadJobs = useCallback(async () => {
@@ -70,14 +71,19 @@ export default function UploadPage() {
         onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
         onDragLeave={() => setDragOver(false)}
         onDrop={(e) => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]) }}
-        onClick={() => document.getElementById("file-input")?.click()}
+        onClick={() => fileInputRef.current?.click()}
       >
         <input
+          ref={fileInputRef}
           id="file-input"
           type="file"
           accept="video/*"
           className="hidden"
-          onChange={(e) => { if (e.target.files?.[0]) handleFile(e.target.files[0]) }}
+          onChange={(e) => {
+            const selectedFile = e.target.files?.[0]
+            e.currentTarget.value = ""
+            if (selectedFile) handleFile(selectedFile)
+          }}
         />
         <div className="flex flex-col items-center">
           <div className="w-12 h-12 bg-primary-soft rounded-full flex items-center justify-center text-primary mb-4">

@@ -8,6 +8,8 @@ const path = require("path")
 
 let mainWindow = null
 let backendProcess = null
+let backendLogPath = ""
+let backendLogStream = null
 let backendPort = parsePort(getEnv("FRAMEBENCH_BACKEND_PORT", "FILM_MASTER_BACKEND_PORT"), 0)
 let apiToken = getEnv("FRAMEBENCH_LOCAL_TOKEN", "FILM_MASTER_LOCAL_TOKEN") || crypto.randomBytes(32).toString("hex")
 const backendStartupTimeoutMs = parsePositiveInteger(getEnv("FRAMEBENCH_BACKEND_TIMEOUT_MS", "FILM_MASTER_BACKEND_TIMEOUT_MS"), 120000)
@@ -16,6 +18,11 @@ const isDev = process.env.ELECTRON_DEV === "1"
 const backendBinaryName = process.platform === "win32" ? "framebench-backend.exe" : "framebench-backend"
 const ffmpegBinaryName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg"
 const ffprobeBinaryName = process.platform === "win32" ? "ffprobe.exe" : "ffprobe"
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) {
+  app.quit()
+}
 
 function getEnv(primaryName, legacyName) {
   return process.env[primaryName] || process.env[legacyName] || ""
@@ -69,6 +76,25 @@ function getPersistentDataRoot() {
   return candidates.find(dataRootHasDb) || app.getPath("userData")
 }
 
+function openBackendLog(dataRoot) {
+  try {
+    const logsDir = path.join(dataRoot, "logs")
+    fs.mkdirSync(logsDir, { recursive: true })
+    backendLogPath = path.join(logsDir, "backend.log")
+    backendLogStream = fs.createWriteStream(backendLogPath, { flags: "a" })
+    writeBackendLog(`Framebench ${app.getVersion()} starting backend`)
+  } catch (err) {
+    backendLogPath = ""
+    backendLogStream = null
+    console.error("[backend] failed to open log file:", err.message)
+  }
+}
+
+function writeBackendLog(message) {
+  if (!backendLogStream) return
+  backendLogStream.write(`[${new Date().toISOString()}] ${message}\n`)
+}
+
 function waitForBackend(port, token, timeoutMs = 120000) {
   const startedAt = Date.now()
 
@@ -110,17 +136,21 @@ function waitForBackend(port, token, timeoutMs = 120000) {
 
 async function startBackend() {
   backendPort = await getAvailablePort(backendPort)
+  const dataRoot = getPersistentDataRoot()
+  openBackendLog(dataRoot)
 
   const baseEnv = {
     ...process.env,
     PYTHONUNBUFFERED: "1",
     FRAMEBENCH_BACKEND_HOST: "127.0.0.1",
     FRAMEBENCH_BACKEND_PORT: String(backendPort),
-    FRAMEBENCH_DATA_DIR: getPersistentDataRoot(),
+    FRAMEBENCH_DATA_DIR: dataRoot,
+    FRAMEBENCH_BACKEND_LOG_FILE: backendLogPath,
     FRAMEBENCH_LOCAL_TOKEN: apiToken,
     FILM_MASTER_BACKEND_HOST: "127.0.0.1",
     FILM_MASTER_BACKEND_PORT: String(backendPort),
-    FILM_MASTER_DATA_DIR: getPersistentDataRoot(),
+    FILM_MASTER_DATA_DIR: dataRoot,
+    FILM_MASTER_BACKEND_LOG_FILE: backendLogPath,
     FILM_MASTER_LOCAL_TOKEN: apiToken,
   }
 
@@ -158,15 +188,21 @@ async function startBackend() {
   })
 
   backendProcess.stdout.on("data", (data) => {
-    console.log(`[backend] ${data.toString().trim()}`)
+    const text = data.toString().trim()
+    console.log(`[backend] ${text}`)
+    writeBackendLog(`[stdout] ${text}`)
   })
   backendProcess.stderr.on("data", (data) => {
-    console.error(`[backend] ${data.toString().trim()}`)
+    const text = data.toString().trim()
+    console.error(`[backend] ${text}`)
+    writeBackendLog(`[stderr] ${text}`)
   })
   backendProcess.on("error", (err) => {
     console.error("[backend] failed to start:", err.message)
+    writeBackendLog(`[error] failed to start: ${err.message}`)
   })
   backendProcess.on("exit", (code, signal) => {
+    writeBackendLog(`[exit] code=${code} signal=${signal}`)
     if (code !== 0 && signal !== "SIGTERM") {
       console.error(`[backend] exited unexpectedly: code=${code} signal=${signal}`)
     }
@@ -177,6 +213,10 @@ function stopBackend() {
   if (backendProcess) {
     backendProcess.kill("SIGTERM")
     backendProcess = null
+  }
+  if (backendLogStream) {
+    backendLogStream.end()
+    backendLogStream = null
   }
 }
 
@@ -256,6 +296,9 @@ function renderStartupLoading() {
 
 function renderStartupError(error) {
   const message = String(error && error.message ? error.message : error)
+  const logHint = backendLogPath
+    ? `<p style="margin-top:16px;font-size:12px;color:#9a8f86;">日志文件：${escapeHtml(backendLogPath)}</p>`
+    : ""
   return `<!doctype html>
 <html lang="zh-CN">
   <meta charset="utf-8" />
@@ -265,6 +308,7 @@ function renderStartupError(error) {
       <p style="font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#9a8f86;">Framebench / 拉片工作台</p>
       <h1 style="font-size:28px;font-weight:500;margin:12px 0;">后端服务没有启动成功</h1>
       <p style="line-height:1.7;color:#6f655c;">${escapeHtml(message)}</p>
+      ${logHint}
       <p style="margin-top:24px;font-size:12px;color:#9a8f86;">请检查 Python 依赖、端口占用，或重新启动应用。</p>
     </main>
   </body>
@@ -281,6 +325,8 @@ function escapeHtml(value) {
 }
 
 app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return
+
   createWindow(null, true)
 
   try {
@@ -295,6 +341,13 @@ app.whenReady().then(async () => {
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
+})
+
+app.on("second-instance", () => {
+  if (!mainWindow) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
 })
 
 app.on("window-all-closed", () => {
