@@ -2,6 +2,7 @@ import json
 import os
 import base64
 import asyncio
+import sys
 from collections.abc import Callable
 from typing import Optional
 from sqlalchemy import select
@@ -24,9 +25,7 @@ class AnalysisService:
         # Build audio summary
         audio_text = self._format_audio(audio_analysis)
 
-        prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "cinematography.md")
-        with open(prompt_path, "r") as f:
-            template = f.read()
+        template = _load_prompt_template("cinematography.md")
 
         for batch_idx in range(0, len(shots), BATCH_SIZE):
             self._raise_if_cancelled(cancel_check)
@@ -168,6 +167,22 @@ def _load_keyframe_images(job_dir: str, shot_number: int) -> list[dict]:
                 "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
             })
     return content
+
+
+def _load_prompt_template(filename: str) -> str:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    candidates = []
+    if bundle_root:
+        candidates.append(os.path.join(bundle_root, "backend", "prompts", filename))
+    candidates.append(os.path.join(os.path.dirname(__file__), "..", "prompts", filename))
+
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+
+    checked = ", ".join(os.path.abspath(path) for path in candidates)
+    raise FileNotFoundError(f"Prompt template not found: {filename}. Checked: {checked}")
 
 
 def _format_features(f: dict) -> str:

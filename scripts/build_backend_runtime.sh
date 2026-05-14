@@ -8,9 +8,11 @@ RUNTIME_DIR="$ROOT_DIR/frontend/backend-runtime"
 BACKEND_OUT_DIR="$RUNTIME_DIR/backend"
 BIN_OUT_DIR="$RUNTIME_DIR/bin"
 BACKEND_BINARY_NAME="framebench-backend"
+PYINSTALLER_DATA_SEP=":"
 
 if [[ "$(uname -s)" == "MINGW"* || "$(uname -s)" == "MSYS"* || "$(uname -s)" == "CYGWIN"* ]]; then
   BACKEND_BINARY_NAME="framebench-backend.exe"
+  PYINSTALLER_DATA_SEP=";"
 fi
 
 resolve_tool() {
@@ -93,6 +95,7 @@ echo "Building backend executable..."
   --workpath "$BUILD_DIR/work" \
   --specpath "$BUILD_DIR/spec" \
   --paths "$ROOT_DIR" \
+  --add-data "$ROOT_DIR/backend/prompts${PYINSTALLER_DATA_SEP}backend/prompts" \
   --collect-all whisper \
   --collect-all tiktoken \
   --collect-submodules uvicorn \
