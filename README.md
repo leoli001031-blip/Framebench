@@ -4,7 +4,27 @@ Framebench / 拉片工作台 is a small desktop workbench for film analysis, sho
 
 It is built for creators who want to quickly upload a film clip, break it into shots, read an AI-assisted analysis report, keep a lightweight reference library, and turn selected references into storyboard prompts.
 
-![Framebench main screen](docs/screenshots/framebench-main.png)
+## Screenshots
+
+### Analysis
+
+![Recent analysis list](docs/screenshots/01-analysis.png)
+
+### Report
+
+![AI film analysis report](docs/screenshots/02-report.png)
+
+### Library
+
+![Reference library](docs/screenshots/03-library.png)
+
+### Storyboard
+
+![Storyboard workspace](docs/screenshots/04-storyboard.png)
+
+### Settings
+
+![Local model and API settings](docs/screenshots/05-settings.png)
 
 ## Features
 
@@ -49,3 +69,7 @@ Typical macOS data locations:
 
 - `~/Library/Application Support/Framebench`
 - compatible legacy folders from earlier builds, when present
+
+## License
+
+MIT

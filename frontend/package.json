@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "description": "A desktop workbench for film analysis, shot reference, and storyboard generation.",
   "author": "zc",
+  "license": "MIT",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
