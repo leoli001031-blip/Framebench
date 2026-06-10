@@ -1,8 +1,8 @@
-import { useState, useEffect } from "react"
+import { useRef, useState, useEffect } from "react"
 import { useParams, Link } from "react-router-dom"
 import { getJob, getReport } from "@/lib/api"
-import { getFrameUrl, downloadFile } from "@/lib/utils"
-import type { JobDetail } from "@/types"
+import { getFrameUrl, getShotVideoUrl, downloadFile } from "@/lib/utils"
+import type { JobDetail, ShotInfo } from "@/types"
 import JobCard from "@/components/JobCard"
 
 export default function ReportPage() {
@@ -146,15 +146,9 @@ export default function ReportPage() {
 
           return (
             <div id={`shot-${shot.shot_number}`} key={shot.id} className="group flex flex-col md:flex-row gap-12 items-start border-b border-line/5 pb-12 last:border-0 scroll-mt-24">
-              {/* Left Side: Frame Image - Lowered for visual balance */}
+              {/* Left Side: Frame / Clip Preview - Lowered for visual balance */}
               <div className="w-full md:w-80 lg:w-96 flex-shrink-0 md:mt-8">
-                <div className="w-full aspect-video rounded-2xl bg-primary-soft/5 overflow-hidden border border-line/5 shadow-sm transition-all duration-700 group-hover:shadow-md">
-                  {frameUrl ? (
-                    <img src={frameUrl} alt={`镜${shot.shot_number}`} className="w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105" />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-[9px] text-muted/20 font-serif italic tracking-widest uppercase">暂无画面</div>
-                  )}
-                </div>
+                <ShotMediaPreview jobId={job.id} shot={shot} frameUrl={frameUrl} />
               </div>
 
 
@@ -193,6 +187,69 @@ export default function ReportPage() {
             </div>
           )
         })}
+      </div>
+    </div>
+  )
+}
+
+function ShotMediaPreview({ jobId, shot, frameUrl }: { jobId: string; shot: ShotInfo; frameUrl: string | null }) {
+  const [showVideo, setShowVideo] = useState(false)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const startSec = Math.max(0, shot.start_time_sec)
+  const endSec = Math.max(startSec, shot.end_time_sec)
+  const durationSec = Math.max(0, endSec - startSec)
+  const videoUrl = getShotVideoUrl(jobId, startSec, endSec)
+
+  const syncStartTime = () => {
+    const video = videoRef.current
+    if (!video) return
+    if (video.currentTime < startSec || video.currentTime >= endSec) {
+      video.currentTime = startSec
+    }
+  }
+
+  const stopAtEnd = () => {
+    const video = videoRef.current
+    if (!video) return
+    if (video.currentTime >= endSec) {
+      video.pause()
+      video.currentTime = startSec
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="relative w-full aspect-video rounded-2xl bg-primary-soft/5 overflow-hidden border border-line/5 shadow-sm transition-all duration-700 group-hover:shadow-md">
+        {showVideo ? (
+          <video
+            ref={videoRef}
+            src={videoUrl}
+            poster={frameUrl || undefined}
+            controls
+            preload="metadata"
+            playsInline
+            onLoadedMetadata={syncStartTime}
+            onPlay={syncStartTime}
+            onTimeUpdate={stopAtEnd}
+            className="w-full h-full object-contain bg-black"
+          />
+        ) : frameUrl ? (
+          <img src={frameUrl} alt={`镜${shot.shot_number}`} className="w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105" />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-[9px] text-muted/20 font-serif italic tracking-widest uppercase">暂无画面</div>
+        )}
+      </div>
+      <div className="flex items-center justify-between gap-3 px-1">
+        <span className="text-[9px] font-black text-muted/25 uppercase tracking-[0.2em]">
+          {startSec.toFixed(1)}s - {endSec.toFixed(1)}s / {durationSec.toFixed(1)}s
+        </span>
+        <button
+          type="button"
+          onClick={() => setShowVideo((prev) => !prev)}
+          className="text-[10px] text-primary/55 hover:text-primary font-black uppercase tracking-[0.2em] transition-colors"
+        >
+          {showVideo ? "查看截图" : "播放片段"}
+        </button>
       </div>
     </div>
   )

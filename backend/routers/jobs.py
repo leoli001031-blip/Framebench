@@ -5,7 +5,7 @@ import shutil
 import traceback
 import uuid
 from typing import Optional
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -36,6 +36,38 @@ def _read_report(report_path: str) -> str:
     """Read report file (blocking I/O, intended for asyncio.to_thread)."""
     with open(report_path, "r") as f:
         return f.read()
+
+
+def _iter_file_range(file_path: str, start: int, end: int, chunk_size: int = 1024 * 1024):
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = f.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
+    if not range_header.startswith("bytes="):
+        raise ValueError("Only byte ranges are supported")
+
+    range_value = range_header.removeprefix("bytes=").split(",", 1)[0].strip()
+    start_text, _, end_text = range_value.partition("-")
+
+    if start_text == "":
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            raise ValueError("Invalid suffix range")
+        return max(file_size - suffix_length, 0), file_size - 1
+
+    start = int(start_text)
+    end = int(end_text) if end_text else file_size - 1
+    if start < 0 or end < start or start >= file_size:
+        raise ValueError("Invalid byte range")
+    return start, min(end, file_size - 1)
 
 
 def validate_job_id(job_id: str) -> str:
@@ -191,6 +223,50 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "Job not found")
 
     return job
+
+
+@router.get("/jobs/{job_id}/video")
+async def get_job_video(job_id: str, request: Request, db: AsyncSession = Depends(get_db)):
+    validate_job_id(job_id)
+    result = await db.execute(select(Job).where(Job.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if not os.path.exists(job.video_path):
+        raise HTTPException(404, "Video file not found")
+
+    file_size = os.path.getsize(job.video_path)
+    range_header = request.headers.get("range")
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "video/mp4",
+        "Content-Disposition": "inline",
+    }
+
+    if range_header:
+        try:
+            start, end = _parse_range_header(range_header, file_size)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=416,
+                detail="Invalid range",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+        headers.update({
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(end - start + 1),
+        })
+        return StreamingResponse(
+            _iter_file_range(job.video_path, start, end),
+            status_code=206,
+            headers=headers,
+        )
+
+    headers["Content-Length"] = str(file_size)
+    return StreamingResponse(
+        _iter_file_range(job.video_path, 0, file_size - 1),
+        headers=headers,
+    )
 
 
 @router.delete("/jobs/{job_id}", response_model=DeleteResponse)

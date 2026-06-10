@@ -13,6 +13,13 @@ export function getFrameUrl(keyframePaths: string): string | null {
   }
 }
 
+export function getShotVideoUrl(jobId: string, startSec: number, endSec: number): string {
+  const baseUrl = withAuthQuery(`${API_BASE}/jobs/${encodeURIComponent(jobId)}/video`)
+  const start = Math.max(0, startSec).toFixed(2)
+  const end = Math.max(startSec, endSec).toFixed(2)
+  return `${baseUrl}#t=${start},${end}`
+}
+
 /** Sort category entries with "未分类" always last */
 export function categorySort<T>([a]: [string, T], [b]: [string, T]): number {
   if (a === "未分类") return 1
