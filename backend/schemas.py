@@ -3,7 +3,7 @@ from typing import Optional
 from datetime import datetime
 
 
-class JobResponse(BaseModel):
+class JobListResponse(BaseModel):
     id: str
     filename: str
     status: str
@@ -12,11 +12,14 @@ class JobResponse(BaseModel):
     duration_sec: Optional[float] = None
     error_message: Optional[str] = None
     category: Optional[str] = None
-    overview_text: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class JobResponse(JobListResponse):
+    overview_text: Optional[str] = None
 
 
 class JobDetailResponse(JobResponse):
@@ -52,6 +55,18 @@ class ShotResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ShotProgressResponse(BaseModel):
+    id: int
+    shot_number: int
+    start_time_sec: float
+    end_time_sec: float
+    keyframe_paths: str
+    status: str
+    analysis_text: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
 class TranscriptSegmentResponse(BaseModel):
     id: int
     start_sec: float
@@ -64,6 +79,31 @@ class TranscriptSegmentResponse(BaseModel):
 class JobWithShotsResponse(JobResponse):
     shots: list[ShotResponse] = []
     transcript_segments: list[TranscriptSegmentResponse] = []
+
+    model_config = {"from_attributes": True}
+
+
+class JobShotsPageResponse(BaseModel):
+    shots_total: int = 0
+    shot_offset: int = 0
+    shot_limit: int = 0
+    shots_returned: int = 0
+    shots_truncated: bool = False
+    shots: list[ShotResponse] = []
+
+    model_config = {"from_attributes": True}
+
+
+class JobProgressResponse(JobListResponse):
+    shots_total: int = 0
+    completed_shots: int = 0
+    failed_shots: int = 0
+    pending_shots: int = 0
+    shot_offset: int = 0
+    shot_limit: int = 0
+    shots_returned: int = 0
+    shots_truncated: bool = False
+    shots: list[ShotProgressResponse] = []
 
     model_config = {"from_attributes": True}
 

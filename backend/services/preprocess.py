@@ -5,9 +5,15 @@ import subprocess
 import threading
 from collections.abc import Callable
 from typing import Optional
-from backend.config import FFMPEG_BIN, FFPROBE_BIN, JOBS_DIR
+from PIL import Image
+from backend.config import (
+    FFMPEG_BIN, FFPROBE_BIN, JOBS_DIR,
+    UI_FRAME_MAX_SIDE, UI_FRAME_JPEG_QUALITY,
+    FRAME_EXTRACTION_CONCURRENCY,
+)
 from backend.database import AsyncSessionLocal
 from backend.models import Job, Shot, TranscriptSegment
+from backend.services.perf import directory_size_bytes, perf_now, record_duration
 
 _whisper_model = None
 _whisper_lock = threading.Lock()
@@ -36,7 +42,9 @@ class Preprocessor:
             "event": "status",
             "data": {"phase": "preprocessing", "step": "shot_detection", "message": "Detecting shots..."}
         })
+        phase_started = perf_now()
         shots = await asyncio.to_thread(self._detect_shots, video_path, job_dir)
+        record_duration(job_dir, "shot_detection_sec", phase_started, {"shot_count": len(shots)})
         self._raise_if_cancelled(cancel_check)
         await queue.put({
             "event": "status",
@@ -49,7 +57,9 @@ class Preprocessor:
             "data": {"phase": "preprocessing", "step": "audio_analysis", "message": "Analyzing audio..."}
         })
         from backend.services.audio_analyzer import analyze_audio
+        phase_started = perf_now()
         audio_analysis = await asyncio.to_thread(analyze_audio, video_path, job_dir)
+        record_duration(job_dir, "audio_analysis_sec", phase_started)
         self._raise_if_cancelled(cancel_check)
         self._save_audio_analysis(job_dir, audio_analysis)
 
@@ -59,22 +69,47 @@ class Preprocessor:
             "data": {"phase": "preprocessing", "step": "frame_extraction", "message": "Extracting keyframes..."}
         })
 
-        for i, shot in enumerate(shots):
+        phase_started = perf_now()
+        frame_semaphore = asyncio.Semaphore(max(1, FRAME_EXTRACTION_CONCURRENCY))
+
+        async def process_one_shot(shot: dict):
             self._raise_if_cancelled(cancel_check)
             sn = shot["shot_number"]
             shot_dir = os.path.join(frames_dir, f"shot_{sn:04d}")
             os.makedirs(shot_dir, exist_ok=True)
 
-            # Offload all blocking work (ffmpeg, cv2, numpy, PIL) to a thread
-            await asyncio.to_thread(self._process_shot, video_path, job_id, shot, shot_dir)
-            self._raise_if_cancelled(cancel_check)
+            async with frame_semaphore:
+                self._raise_if_cancelled(cancel_check)
+                await asyncio.to_thread(self._process_shot, video_path, job_id, shot, shot_dir)
+                self._raise_if_cancelled(cancel_check)
 
-            if i % 10 == 0:
-                await queue.put({
-                    "event": "status",
-                    "data": {"phase": "preprocessing", "step": "frame_extraction",
-                             "progress": i / len(shots), "shot": i, "total": len(shots)}
-                })
+        processed = 0
+        tasks = [asyncio.create_task(process_one_shot(shot)) for shot in shots]
+        try:
+            for task in asyncio.as_completed(tasks):
+                await task
+                processed += 1
+                if processed % 10 == 0 or processed == len(shots):
+                    await queue.put({
+                        "event": "status",
+                        "data": {"phase": "preprocessing", "step": "frame_extraction",
+                                 "progress": processed / len(shots), "shot": processed, "total": len(shots)}
+                    })
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        frame_bytes = await asyncio.to_thread(directory_size_bytes, frames_dir)
+        record_duration(
+            job_dir,
+            "frame_extraction_sec",
+            phase_started,
+            {
+                "frame_bytes": frame_bytes,
+                "frame_extraction_concurrency": max(1, FRAME_EXTRACTION_CONCURRENCY),
+            },
+        )
 
         # Save shots to DB
         async with AsyncSessionLocal() as db:
@@ -101,7 +136,9 @@ class Preprocessor:
             "event": "status",
             "data": {"phase": "preprocessing", "step": "transcription", "message": "Transcribing audio..."}
         })
+        phase_started = perf_now()
         transcript = await self._transcribe(video_path, job_dir, job_id, queue)
+        record_duration(job_dir, "transcription_sec", phase_started, {"transcript_segments": len(transcript)})
 
         return shots, transcript, audio_analysis
 
@@ -173,6 +210,17 @@ class Preprocessor:
         if result.returncode != 0:
             raise RuntimeError(f"Frame extraction failed: {result.stderr}")
 
+    def _create_ui_thumbnail(self, source_path: str, output_path: str) -> str:
+        try:
+            with Image.open(source_path) as img:
+                img = img.convert("RGB")
+                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+                img.thumbnail((UI_FRAME_MAX_SIDE, UI_FRAME_MAX_SIDE), resampling)
+                img.save(output_path, "JPEG", quality=UI_FRAME_JPEG_QUALITY, optimize=True)
+            return output_path
+        except Exception:
+            return source_path
+
     def _process_shot(self, video_path: str, job_id: str, shot: dict, shot_dir: str):
         """Run all blocking per-shot work: frame extraction, analysis, optical flow."""
         from backend.services.frame_analyzer import analyze_frame, compute_optical_flow
@@ -186,11 +234,17 @@ class Preprocessor:
         start_frame = os.path.join(shot_dir, "frame_start.jpg")
         mid_frame = os.path.join(shot_dir, "frame_mid.jpg")
         end_frame = os.path.join(shot_dir, "frame_end.jpg")
+        start_thumb = os.path.join(shot_dir, "frame_start_thumb.jpg")
+        mid_thumb = os.path.join(shot_dir, "frame_mid_thumb.jpg")
+        end_thumb = os.path.join(shot_dir, "frame_end_thumb.jpg")
 
         self._extract_frame(video_path, start_frame, start_sec)
         self._extract_frame(video_path, mid_frame, mid_sec)
         end_time = max(start_sec + 0.1, end_sec - 0.15)
         self._extract_frame(video_path, end_frame, end_time)
+        start_preview = self._create_ui_thumbnail(start_frame, start_thumb)
+        mid_preview = self._create_ui_thumbnail(mid_frame, mid_thumb)
+        end_preview = self._create_ui_thumbnail(end_frame, end_thumb)
 
         frame_features = analyze_frame(start_frame)
         shot["frame_features"] = frame_features
@@ -207,22 +261,23 @@ class Preprocessor:
         else:
             shot["optical_flow"] = {"前半段": "无法计算", "后半段": "无法计算"}
 
-        keyframes = [f"{job_id}/frames/shot_{sn:04d}/frame_start.jpg"]
-        if os.path.exists(mid_frame):
-            keyframes.append(f"{job_id}/frames/shot_{sn:04d}/frame_mid.jpg")
-        if os.path.exists(end_frame):
-            keyframes.append(f"{job_id}/frames/shot_{sn:04d}/frame_end.jpg")
+        keyframes = [f"{job_id}/frames/shot_{sn:04d}/{os.path.basename(start_preview)}"]
+        if os.path.exists(mid_preview):
+            keyframes.append(f"{job_id}/frames/shot_{sn:04d}/{os.path.basename(mid_preview)}")
+        if os.path.exists(end_preview):
+            keyframes.append(f"{job_id}/frames/shot_{sn:04d}/{os.path.basename(end_preview)}")
         shot["keyframe_paths"] = json.dumps(keyframes)
 
     def _run_transcription(self, video_path: str, audio_file: str) -> list[dict]:
         """Run ffmpeg audio extraction + whisper transcription (blocking)."""
-        result = subprocess.run(
-            [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
-             "-ar", "16000", "-ac", "1", audio_file],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Audio extraction failed: {result.stderr}")
+        if not os.path.exists(audio_file) or os.path.getsize(audio_file) < 1000:
+            result = subprocess.run(
+                [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+                 "-ar", "16000", "-ac", "1", audio_file],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Audio extraction failed: {result.stderr}")
 
         segments = []
         try:

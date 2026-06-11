@@ -1,14 +1,24 @@
 import { getApiBase, withAuthQuery } from "@/lib/runtime"
 
 const API_BASE = getApiBase()
+const frameUrlCache = new Map<string, string | null>()
 
 export function getFrameUrl(keyframePaths: string): string | null {
+  const cached = frameUrlCache.get(keyframePaths)
+  if (cached !== undefined) return cached
+
   try {
     const paths: string[] = JSON.parse(keyframePaths)
-    if (!paths[0]) return null
+    if (!paths[0]) {
+      frameUrlCache.set(keyframePaths, null)
+      return null
+    }
     const p = paths[0].replace(/^.*?data\/jobs\//, "")
-    return withAuthQuery(`${API_BASE}/frames/${p}`)
+    const result = withAuthQuery(`${API_BASE}/frames/${p}`)
+    frameUrlCache.set(keyframePaths, result)
+    return result
   } catch {
+    frameUrlCache.set(keyframePaths, null)
     return null
   }
 }

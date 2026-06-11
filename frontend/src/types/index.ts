@@ -7,7 +7,7 @@ export interface JobInfo {
   duration_sec: number | null
   error_message: string | null
   category: string | null
-  overview_text: string | null
+  overview_text?: string | null
   created_at: string
   updated_at: string
 }
@@ -32,9 +32,45 @@ export interface ShotInfo {
   dimensions: DimensionInfo[]
 }
 
+export interface ShotProgressInfo {
+  id: number
+  shot_number: number
+  start_time_sec: number
+  end_time_sec: number
+  keyframe_paths: string
+  status: string
+  analysis_text: string | null
+}
+
 export interface JobDetail extends JobInfo {
+  overview_text: string | null
   shots: ShotInfo[]
   transcript_segments: TranscriptSegment[]
+}
+
+export interface JobSummary extends JobInfo {
+  overview_text: string | null
+}
+
+export interface JobShotsPage {
+  shots_total: number
+  shot_offset: number
+  shot_limit: number
+  shots_returned: number
+  shots_truncated: boolean
+  shots: ShotInfo[]
+}
+
+export interface JobProgress extends JobInfo {
+  shots_total: number
+  completed_shots: number
+  failed_shots: number
+  pending_shots: number
+  shot_offset: number
+  shot_limit: number
+  shots_returned: number
+  shots_truncated: boolean
+  shots: ShotProgressInfo[]
 }
 
 export interface TranscriptSegment {

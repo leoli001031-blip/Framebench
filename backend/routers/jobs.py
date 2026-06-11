@@ -2,12 +2,13 @@ import asyncio
 import json
 import os
 import shutil
+import time
 import traceback
 import uuid
-from typing import Optional
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request
+from typing import Annotated, Optional
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db, AsyncSessionLocal
@@ -16,7 +17,9 @@ from backend.models import (
     StoryboardGenerationTask, SystemSetting,
 )
 from backend.schemas import (
-    JobResponse, JobDetailResponse, JobWithShotsResponse,
+    JobListResponse, JobProgressResponse, JobResponse, JobDetailResponse,
+    JobWithShotsResponse, ShotProgressResponse,
+    JobShotsPageResponse,
     UploadResponse, StartResponse, DeleteResponse,
     UpdateJobRequest, GenerateStoryboardRequest, StoryboardResponse,
     CategoryListResponse, StoryboardHistoryItem, StoryboardDetailResponse,
@@ -204,10 +207,30 @@ async def start_job(job_id: str):
     return StartResponse(job_id=job_id, status="preprocessing")
 
 
-@router.get("/jobs", response_model=list[JobResponse])
-async def list_jobs(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Job).order_by(Job.created_at.desc()))
-    return result.scalars().all()
+@router.get("/jobs", response_model=list[JobListResponse])
+async def list_jobs(
+    db: AsyncSession = Depends(get_db),
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    result = await db.execute(
+        select(
+            Job.id,
+            Job.filename,
+            Job.status,
+            Job.progress,
+            Job.total_shots,
+            Job.duration_sec,
+            Job.error_message,
+            Job.category,
+            Job.created_at,
+            Job.updated_at,
+        )
+        .order_by(Job.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return [JobListResponse(**row._mapping) for row in result.all()]
 
 
 @router.get("/jobs/{job_id}", response_model=JobWithShotsResponse)
@@ -223,6 +246,169 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "Job not found")
 
     return job
+
+
+@router.get("/jobs/{job_id}/summary", response_model=JobResponse)
+async def get_job_summary(job_id: str, db: AsyncSession = Depends(get_db)):
+    validate_job_id(job_id)
+    result = await db.execute(
+        select(
+            Job.id,
+            Job.filename,
+            Job.status,
+            Job.progress,
+            Job.total_shots,
+            Job.duration_sec,
+            Job.error_message,
+            Job.category,
+            Job.overview_text,
+            Job.created_at,
+            Job.updated_at,
+        )
+        .where(Job.id == job_id)
+    )
+    row = result.one_or_none()
+    if not row:
+        raise HTTPException(404, "Job not found")
+    return JobResponse(**row._mapping)
+
+
+@router.get("/jobs/{job_id}/shots", response_model=JobShotsPageResponse)
+async def get_job_shots(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    limit: Annotated[int, Query(ge=1, le=500)] = 80,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    validate_job_id(job_id)
+    job_exists = await db.scalar(select(func.count(Job.id)).where(Job.id == job_id))
+    if not job_exists:
+        raise HTTPException(404, "Job not found")
+
+    shots_total = int(await db.scalar(select(func.count(Shot.id)).where(Shot.job_id == job_id)) or 0)
+    result = await db.execute(
+        select(Shot)
+        .where(Shot.job_id == job_id)
+        .options(selectinload(Shot.dimensions))
+        .order_by(Shot.shot_number)
+        .limit(limit)
+        .offset(offset)
+    )
+    shots = result.scalars().all()
+    return JobShotsPageResponse(
+        shots_total=shots_total,
+        shot_offset=offset,
+        shot_limit=limit,
+        shots_returned=len(shots),
+        shots_truncated=offset + len(shots) < shots_total,
+        shots=shots,
+    )
+
+
+@router.get("/jobs/{job_id}/progress", response_model=JobProgressResponse)
+async def get_job_progress(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    include_shots: Annotated[bool, Query()] = False,
+    shot_limit: Annotated[int, Query(ge=0, le=500)] = 20,
+    shot_offset: Annotated[int, Query(ge=0)] = 0,
+):
+    validate_job_id(job_id)
+    result = await db.execute(
+        select(
+            Job.id,
+            Job.filename,
+            Job.status,
+            Job.progress,
+            Job.total_shots,
+            Job.duration_sec,
+            Job.error_message,
+            Job.category,
+            Job.created_at,
+            Job.updated_at,
+        )
+        .where(Job.id == job_id)
+    )
+    job_row = result.one_or_none()
+    if not job_row:
+        raise HTTPException(404, "Job not found")
+
+    counts_result = await db.execute(
+        select(Shot.status, func.count(Shot.id))
+        .where(Shot.job_id == job_id)
+        .group_by(Shot.status)
+    )
+    status_counts = {status: count for status, count in counts_result.all()}
+    counted_total = sum(status_counts.values())
+    shots_total = int(job_row._mapping["total_shots"] or counted_total)
+    completed_shots = int(status_counts.get("completed", 0))
+    failed_shots = int(status_counts.get("failed", 0))
+    pending_shots = max(0, shots_total - completed_shots - failed_shots)
+    bounded_limit = max(0, shot_limit)
+
+    shot_rows = []
+    effective_offset = shot_offset if include_shots else 0
+    if bounded_limit > 0:
+        if include_shots:
+            shots_query = (
+                _progress_shot_select()
+                .where(Shot.job_id == job_id)
+                .order_by(Shot.shot_number)
+                .limit(bounded_limit)
+                .offset(effective_offset)
+            )
+            shots_result = await db.execute(shots_query)
+            shot_rows = shots_result.all()
+        else:
+            active_result = await db.execute(
+                _progress_shot_select()
+                .where(Shot.job_id == job_id, Shot.status != "completed")
+                .order_by(Shot.shot_number)
+                .limit(bounded_limit)
+            )
+            shot_rows = active_result.all()
+            if not shot_rows and completed_shots > 0:
+                recent_result = await db.execute(
+                    _progress_shot_select()
+                    .where(Shot.job_id == job_id)
+                    .order_by(Shot.shot_number.desc())
+                    .limit(bounded_limit)
+                )
+                shot_rows = list(reversed(recent_result.all()))
+
+    shots_returned = len(shot_rows)
+    if include_shots:
+        shots_truncated = shot_offset + shots_returned < counted_total
+    else:
+        shots_truncated = shots_returned < counted_total
+
+    return JobProgressResponse(
+        **job_row._mapping,
+        shots_total=shots_total,
+        completed_shots=completed_shots,
+        failed_shots=failed_shots,
+        pending_shots=pending_shots,
+        shot_offset=effective_offset,
+        shot_limit=bounded_limit,
+        shots_returned=shots_returned,
+        shots_truncated=shots_truncated,
+        shots=[
+            ShotProgressResponse(**row._mapping)
+            for row in shot_rows
+        ],
+    )
+
+
+def _progress_shot_select():
+    return select(
+        Shot.id,
+        Shot.shot_number,
+        Shot.start_time_sec,
+        Shot.end_time_sec,
+        Shot.keyframe_paths,
+        Shot.status,
+        Shot.analysis_text,
+    )
 
 
 @router.get("/jobs/{job_id}/video")
@@ -378,14 +564,25 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
             "data": {"task": _serialize_storyboard_task(task).model_dump(mode="json")},
         })
 
-    async def publish_progress(message: str, status: str, progress: float):
-        await _update_storyboard_task(
-            task_id,
-            status=status,
-            progress=progress,
-            message=message,
-            error_message=None,
+    last_persisted = {"status": "queued", "progress": 0.02, "at": time.monotonic()}
+
+    async def publish_progress(message: str, status: str, progress: float, force: bool = False):
+        now = time.monotonic()
+        should_persist = (
+            force
+            or status != last_persisted["status"]
+            or progress - float(last_persisted["progress"]) >= 0.05
+            or now - float(last_persisted["at"]) >= 1.5
         )
+        if should_persist:
+            await _update_storyboard_task(
+                task_id,
+                status=status,
+                progress=progress,
+                message=message,
+                error_message=None,
+            )
+            last_persisted.update({"status": status, "progress": progress, "at": now})
         await queue.put({
             "event": "progress",
             "data": {
@@ -403,7 +600,7 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
                 f"Storyboard generation started: refs={len(req.reference_job_ids)}, "
                 f"target_duration={req.target_duration_sec or 'unset'}"
             )
-            await publish_progress("正在读取参考素材…", "collecting", 0.08)
+            await publish_progress("正在读取参考素材…", "collecting", 0.08, force=True)
             # Collect reference analyses
             references = []
             async with AsyncSessionLocal() as db:
@@ -453,7 +650,7 @@ async def generate_storyboard(req: GenerateStoryboardRequest):
             )
 
             # Save to history
-            await publish_progress("正在保存分镜脚本…", "saving", 0.94)
+            await publish_progress("正在保存分镜脚本…", "saving", 0.94, force=True)
             sb_id = str(uuid.uuid4())
             async with AsyncSessionLocal() as db:
                 sb = Storyboard(
@@ -549,23 +746,55 @@ async def list_storyboard_generations(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/storyboards", response_model=list[StoryboardHistoryItem])
-async def list_storyboards(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(Storyboard)
-        .options(selectinload(Storyboard.shots))
+async def list_storyboards(
+    db: AsyncSession = Depends(get_db),
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    storyboard_page = (
+        select(
+            Storyboard.id,
+            Storyboard.title,
+            Storyboard.brief,
+            Storyboard.total_duration_sec,
+            Storyboard.created_at,
+        )
         .order_by(Storyboard.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+        .subquery()
     )
-    rows = result.scalars().all()
+    shot_counts = (
+        select(
+            StoryboardShot.storyboard_id,
+            func.count(StoryboardShot.id).label("shot_count"),
+        )
+        .where(StoryboardShot.storyboard_id.in_(select(storyboard_page.c.id)))
+        .group_by(StoryboardShot.storyboard_id)
+        .subquery()
+    )
+    result = await db.execute(
+        select(
+            storyboard_page.c.id,
+            storyboard_page.c.title,
+            storyboard_page.c.brief,
+            storyboard_page.c.total_duration_sec,
+            storyboard_page.c.created_at,
+            func.coalesce(shot_counts.c.shot_count, 0).label("shot_count"),
+        )
+        .outerjoin(shot_counts, shot_counts.c.storyboard_id == storyboard_page.c.id)
+        .order_by(storyboard_page.c.created_at.desc())
+    )
     return [
         StoryboardHistoryItem(
-            id=r.id,
-            title=r.title,
-            brief=r.brief[:200],
-            total_duration_sec=r.total_duration_sec,
-            shot_count=len(r.shots),
-            created_at=r.created_at,
+            id=row.id,
+            title=row.title,
+            brief=row.brief[:200],
+            total_duration_sec=row.total_duration_sec,
+            shot_count=row.shot_count,
+            created_at=row.created_at,
         )
-        for r in rows
+        for row in result.all()
     ]
 
 
@@ -597,31 +826,6 @@ async def delete_storyboard(storyboard_id: str, db: AsyncSession = Depends(get_d
 async def list_settings(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(SystemSetting))
     settings = result.scalars().all()
-    
-    # Seed if empty or incomplete
-    existing_keys = {s.key for s in settings}
-    target_keys = {
-        "analysis_api_key", "analysis_model", "analysis_base_url",
-        "storyboard_api_key", "storyboard_model", "storyboard_base_url"
-    }
-    
-    if not target_keys.issubset(existing_keys):
-        from backend.config import MOONSHOT_API_KEY, MOONSHOT_MODEL, MOONSHOT_BASE_URL
-        defaults = [
-            SystemSetting(key="analysis_api_key", value=MOONSHOT_API_KEY, description="分析引擎 API 密钥"),
-            SystemSetting(key="analysis_model", value=MOONSHOT_MODEL, description="分析引擎模型名称"),
-            SystemSetting(key="analysis_base_url", value=MOONSHOT_BASE_URL, description="分析引擎接口地址"),
-            SystemSetting(key="storyboard_api_key", value=MOONSHOT_API_KEY, description="分镜引擎 API 密钥"),
-            SystemSetting(key="storyboard_model", value=MOONSHOT_MODEL, description="分镜引擎模型名称"),
-            SystemSetting(key="storyboard_base_url", value=MOONSHOT_BASE_URL, description="分镜引擎接口地址"),
-        ]
-        for d in defaults:
-            if d.key not in existing_keys:
-                db.add(d)
-        await db.commit()
-        result = await db.execute(select(SystemSetting))
-        settings = result.scalars().all()
-        
     return [_serialize_setting(setting) for setting in settings]
 
 

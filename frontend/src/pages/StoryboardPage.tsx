@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react"
+import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { listJobs, generateStoryboardStream, listStoryboards, listStoryboardGenerations, getStoryboard, deleteStoryboard } from "@/lib/api"
 import StatusBean from "@/components/StatusBean"
 import JobCard from "@/components/JobCard"
@@ -26,6 +26,8 @@ export default function StoryboardPage() {
   const [activeTaskId, setActiveTaskId] = useState(() => localStorage.getItem(ACTIVE_STORYBOARD_TASK_ID_KEY) || "")
   const generationAbortRef = useRef<AbortController | null>(null)
   const autoOpenedTaskRef = useRef<string | null>(null)
+  const hasActiveGenerationTask = generating || Boolean(activeTaskId) || generationTasks.some((task) => isStoryboardTaskActive(task.status))
+  const generationPollingIntervalMs = hasActiveGenerationTask ? 2000 : 10000
 
   const load = useCallback(async () => {
     try {
@@ -53,7 +55,7 @@ export default function StoryboardPage() {
   const loadGenerationTasks = useCallback(async () => {
     try {
       const tasks = await listStoryboardGenerations()
-      setGenerationTasks(tasks)
+      setGenerationTasks((prev) => storyboardTasksEqual(prev, tasks) ? prev : tasks)
 
       const storedTaskId = localStorage.getItem(ACTIVE_STORYBOARD_TASK_ID_KEY)
       const activeTask = storedTaskId ? tasks.find((task) => task.id === storedTaskId) : undefined
@@ -92,21 +94,39 @@ export default function StoryboardPage() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void loadGenerationTasks()
-    }, 2000)
+    }, generationPollingIntervalMs)
     return () => window.clearInterval(timer)
-  }, [loadGenerationTasks])
+  }, [generationPollingIntervalMs, loadGenerationTasks])
   useEffect(() => () => generationAbortRef.current?.abort(), [])
-  useEffect(() => { localStorage.setItem("storyboard_brief", brief) }, [brief])
-  useEffect(() => { localStorage.setItem("storyboard_target_dur", targetDur) }, [targetDur])
+  useEffect(() => {
+    if (result) return
+    const timer = window.setTimeout(() => {
+      localStorage.setItem("storyboard_brief", brief)
+    }, 400)
+    return () => window.clearTimeout(timer)
+  }, [brief, result])
+  useEffect(() => {
+    if (result) return
+    const timer = window.setTimeout(() => {
+      localStorage.setItem("storyboard_target_dur", targetDur)
+    }, 400)
+    return () => window.clearTimeout(timer)
+  }, [result, targetDur])
   useEffect(() => { localStorage.setItem("storyboard_selected_ids", JSON.stringify([...selectedIds])) }, [selectedIds])
 
-  const referenceJobs = jobs.filter((j) => j.status === "completed")
-  const visibleHistory = showAllHistory ? history : history.slice(0, 3)
-  const activeGenerationTasks = generationTasks.filter((task) => isStoryboardTaskActive(task.status))
-  const visibleGenerationTasks = (
-    activeGenerationTasks.length > 0
-      ? activeGenerationTasks
-      : generationTasks.filter((task) => task.status === "failed" || task.id === activeTaskId).slice(0, 2)
+  const referenceJobs = useMemo(() => jobs.filter((j) => j.status === "completed"), [jobs])
+  const visibleHistory = useMemo(() => showAllHistory ? history : history.slice(0, 3), [history, showAllHistory])
+  const activeGenerationTasks = useMemo(
+    () => generationTasks.filter((task) => isStoryboardTaskActive(task.status)),
+    [generationTasks],
+  )
+  const visibleGenerationTasks = useMemo(
+    () => (
+      activeGenerationTasks.length > 0
+        ? activeGenerationTasks
+        : generationTasks.filter((task) => task.status === "failed" || task.id === activeTaskId).slice(0, 2)
+    ),
+    [activeGenerationTasks, activeTaskId, generationTasks],
   )
 
   const toggleSelect = (id: string) => {
@@ -118,12 +138,15 @@ export default function StoryboardPage() {
   }
 
   // Group references by category
-  const referenceGroups: Record<string, JobInfo[]> = {}
-  referenceJobs.forEach(job => {
-    const cat = job.category || "未分类"
-    if (!referenceGroups[cat]) referenceGroups[cat] = []
-    referenceGroups[cat].push(job)
-  })
+  const referenceGroups = useMemo(() => {
+    const groups: Record<string, JobInfo[]> = {}
+    referenceJobs.forEach((job) => {
+      const cat = job.category || "未分类"
+      if (!groups[cat]) groups[cat] = []
+      groups[cat].push(job)
+    })
+    return groups
+  }, [referenceJobs])
 
   const toggleCategory = (catName: string) => {
     const groupIds = referenceGroups[catName].map(j => j.id)
@@ -395,7 +418,7 @@ export default function StoryboardPage() {
 	              const isActive = isStoryboardTaskActive(task.status)
 	              const isFailed = task.status === "failed"
 	              return (
-	                <div key={task.id} className="rounded-2xl bg-surface/35 border border-line/5 px-5 py-4">
+	                <div key={task.id} className="perf-row-sm rounded-2xl bg-surface/35 border border-line/5 px-5 py-4">
 	                  <div className="flex items-start justify-between gap-5">
 	                    <div className="min-w-0 flex-1">
 	                      <div className="flex items-center gap-3 mb-2">
@@ -457,7 +480,7 @@ export default function StoryboardPage() {
               <div 
                 key={item.id} 
                 onClick={() => { handleLoadHistory(item.id); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
-                className="group bg-surface/20 border border-line/5 hover:border-line/20 p-8 rounded-[2.5rem] cursor-pointer transition-all duration-700 hover:shadow-[0_30px_60px_rgba(47,39,34,0.1)] hover:-translate-y-2"
+                className="perf-row group bg-surface/20 border border-line/5 hover:border-line/20 p-8 rounded-[2.5rem] cursor-pointer transition-transform duration-700 hover:shadow-[0_30px_60px_rgba(47,39,34,0.1)] hover:-translate-y-2"
               >
                 <div className="flex items-center justify-between mb-6">
                   <span className="text-[10px] font-black text-muted/20 uppercase tracking-[0.2em]">{item.shot_count} 单元</span>
@@ -537,7 +560,7 @@ export default function StoryboardPage() {
             {/* Flattened Horizontal Result List - Compacted */}
             <div className="space-y-4">
               {result.shots.map((shot) => (
-                <div key={shot.shot_number} className="group flex flex-col md:flex-row gap-6 p-6 rounded-2xl bg-surface/40 hover:bg-surface transition-all duration-500 border border-transparent hover:border-line/5 hover:shadow-sm">
+                <div key={shot.shot_number} className="perf-row group flex flex-col md:flex-row gap-6 p-6 rounded-2xl bg-surface/40 hover:bg-surface transition-colors duration-500 border border-transparent hover:border-line/5 hover:shadow-sm">
                   {/* Left Metadata - Compact */}
                   <div className="w-full md:w-24 flex-shrink-0 flex md:flex-col items-center md:items-start justify-between md:justify-start gap-2">
                     <span className="text-4xl font-serif font-light text-ink/20 group-hover:text-primary transition-colors duration-500 leading-none">
@@ -617,4 +640,24 @@ function storyboardTaskStatusLabel(status: string): string {
   if (status === "completed") return "已完成"
   if (status === "failed") return "失败"
   return status
+}
+
+function storyboardTasksEqual(a: StoryboardGenerationTask[], b: StoryboardGenerationTask[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    const prev = a[i]
+    const next = b[i]
+    if (
+      prev.id !== next.id ||
+      prev.status !== next.status ||
+      prev.progress !== next.progress ||
+      prev.message !== next.message ||
+      prev.storyboard_id !== next.storyboard_id ||
+      prev.error_message !== next.error_message ||
+      prev.updated_at !== next.updated_at
+    ) {
+      return false
+    }
+  }
+  return true
 }

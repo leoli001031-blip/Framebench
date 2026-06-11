@@ -17,7 +17,7 @@ def analyze_audio(video_path: str, job_dir: str) -> dict:
     if not os.path.exists(audio_path):
         result = subprocess.run(
             [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
-             "-ar", "22050", "-ac", "1", audio_path],
+             "-ar", "16000", "-ac", "1", audio_path],
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:

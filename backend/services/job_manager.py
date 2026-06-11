@@ -9,6 +9,7 @@ from backend.database import AsyncSessionLocal
 from sqlalchemy import select
 from backend.models import Job, Shot, TranscriptSegment, Dimension
 from sqlalchemy import delete
+from backend.services.perf import perf_now, record_duration, record_metrics
 
 
 class _BroadcastQueue:
@@ -79,34 +80,59 @@ class JobManager:
 
         job_dir = os.path.join(JOBS_DIR, job_id)
         video_path = os.path.join(job_dir, "original.mp4")
+        job_started = perf_now()
 
         try:
-            await asyncio.to_thread(self._clean_generated_outputs, job_dir)
-
-            # Phase 1: Preprocessing
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(select(Job).where(Job.id == job_id))
-                job = result.scalar_one()
-                job.status = "preprocessing"
-                job.progress = 0.0
-                job.total_shots = None
-                job.duration_sec = None
-                job.error_message = None
-                job.overview_text = None
-                # Clean up old shot/transcript data from previous run to avoid IntegrityError
-                shot_ids = (await db.execute(select(Shot.id).where(Shot.job_id == job_id))).scalars().all()
-                if shot_ids:
-                    await db.execute(delete(Dimension).where(Dimension.shot_id.in_(shot_ids)))
-                await db.execute(delete(Shot).where(Shot.job_id == job_id))
-                await db.execute(delete(TranscriptSegment).where(TranscriptSegment.job_id == job_id))
-                await db.commit()
-
             bq = _BroadcastQueue(self, job_id)
-            preprocessor = Preprocessor()
-            shots, transcript, audio_analysis = await preprocessor.run(
-                job_id, video_path, bq,
-                cancel_check=lambda: self.is_cancel_requested(job_id),
-            )
+            resume_data = await self._load_resume_data(job_id, job_dir)
+
+            if resume_data:
+                shots, shots_to_analyze, transcript, audio_analysis = resume_data
+                await asyncio.to_thread(self._clean_report_only, job_dir)
+                record_metrics(job_dir, {
+                    "resume_mode": "failed_or_pending_shots",
+                    "resume_shots": len(shots_to_analyze),
+                })
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(select(Job).where(Job.id == job_id))
+                    job = result.scalar_one()
+                    job.status = "analyzing"
+                    job.error_message = None
+                    job.progress = max(job.progress or 0.0, 0.3)
+                    job.total_shots = len(shots)
+                    job.duration_sec = shots[-1]["end_time_sec"] if shots else job.duration_sec
+                    await db.commit()
+            else:
+                phase_started = perf_now()
+                await asyncio.to_thread(self._clean_generated_outputs, job_dir)
+                record_duration(job_dir, "cleanup_sec", phase_started)
+
+                # Phase 1: Preprocessing
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(select(Job).where(Job.id == job_id))
+                    job = result.scalar_one()
+                    job.status = "preprocessing"
+                    job.progress = 0.0
+                    job.total_shots = None
+                    job.duration_sec = None
+                    job.error_message = None
+                    job.overview_text = None
+                    # Clean up old shot/transcript data from previous run to avoid IntegrityError
+                    shot_ids = (await db.execute(select(Shot.id).where(Shot.job_id == job_id))).scalars().all()
+                    if shot_ids:
+                        await db.execute(delete(Dimension).where(Dimension.shot_id.in_(shot_ids)))
+                    await db.execute(delete(Shot).where(Shot.job_id == job_id))
+                    await db.execute(delete(TranscriptSegment).where(TranscriptSegment.job_id == job_id))
+                    await db.commit()
+
+                preprocessor = Preprocessor()
+                phase_started = perf_now()
+                shots, transcript, audio_analysis = await preprocessor.run(
+                    job_id, video_path, bq,
+                    cancel_check=lambda: self.is_cancel_requested(job_id),
+                )
+                shots_to_analyze = shots
+                record_duration(job_dir, "preprocess_total_sec", phase_started)
 
             # Fail early if no shots were detected (prevents IndexError downstream)
             if not shots:
@@ -120,6 +146,7 @@ class JobManager:
                     "event": "job_error",
                     "data": {"phase": "preprocessing", "error": "未检测到镜头变化"}
                 })
+                record_metrics(job_dir, {"final_status": "failed", "error": "未检测到镜头变化"})
                 return
 
             # Compute video duration from the last shot's end time
@@ -135,19 +162,25 @@ class JobManager:
                 job.error_message = None
                 await db.commit()
 
-            # Phase 2: AI Analysis (vision-based via Moonshot API)
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(select(Job).where(Job.id == job_id))
-                job = result.scalar_one()
-                job.status = "analyzing"
-                job.error_message = None
-                await db.commit()
+            if not resume_data:
+                # Phase 2: AI Analysis (vision-based via Moonshot API)
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(select(Job).where(Job.id == job_id))
+                    job = result.scalar_one()
+                    job.status = "analyzing"
+                    job.error_message = None
+                    await db.commit()
 
-            analysis_service = AnalysisService()
-            await analysis_service.run(
-                job_id, shots, transcript, audio_analysis, bq,
-                cancel_check=lambda: self.is_cancel_requested(job_id),
-            )
+            if shots_to_analyze:
+                analysis_service = AnalysisService()
+                phase_started = perf_now()
+                await analysis_service.run(
+                    job_id, shots_to_analyze, transcript, audio_analysis, bq,
+                    cancel_check=lambda: self.is_cancel_requested(job_id),
+                )
+                record_duration(job_dir, "analysis_total_sec", phase_started)
+            else:
+                record_metrics(job_dir, {"analysis_total_sec": 0, "resume_shots": 0})
 
             # Re-read shot analyses from DB to populate in-memory shots for overview
             async with AsyncSessionLocal() as db:
@@ -180,6 +213,11 @@ class JobManager:
                 result = await db.execute(select(Job).where(Job.id == job_id))
                 job = result.scalar_one()
                 pending_count = max(0, len(shots) - completed_count - failed_count)
+                record_metrics(job_dir, {
+                    "completed_shots": completed_count,
+                    "failed_shots": failed_count,
+                    "pending_shots": pending_count,
+                })
                 if completed_count == 0 and len(shots) > 0:
                     job.status = "failed"
                     job.error_message = "All shots failed analysis"
@@ -198,6 +236,7 @@ class JobManager:
                     "event": "status",
                     "data": {"phase": "analyzing", "step": "overview", "message": "Generating overview..."}
                 })
+                phase_started = perf_now()
                 try:
                     from backend.services.overview_generator import generate_overview
                     shot_data = [
@@ -226,16 +265,20 @@ class JobManager:
                         print(f"Overview generation failed after 3 attempts")
                 except Exception as e:
                     print(f"Overview generation failed: {e}")
+                finally:
+                    record_duration(job_dir, "overview_sec", phase_started)
 
                 await self._broadcast(job_id, {
                     "event": "complete",
                     "data": {"job_id": job_id, "total_shots": completed_count, "message": f"Analysis complete: {completed_count}/{len(shots)} shots"}
                 })
+                record_metrics(job_dir, {"final_status": job.status})
             else:
                 await self._broadcast(job_id, {
                     "event": "job_error",
                     "data": {"phase": "failed", "error": "All shots failed analysis"}
                 })
+                record_metrics(job_dir, {"final_status": "failed", "error": "All shots failed analysis"})
 
         except asyncio.CancelledError:
             async with AsyncSessionLocal() as db:
@@ -249,6 +292,7 @@ class JobManager:
                 "event": "job_error",
                 "data": {"phase": "cancelled", "error": "Cancelled by user"}
             })
+            record_metrics(job_dir, {"final_status": "failed", "error": "Cancelled by user"})
 
         except (httpx.HTTPError, RuntimeError, OSError, ValueError) as e:
             async with AsyncSessionLocal() as db:
@@ -263,6 +307,7 @@ class JobManager:
                 "event": "job_error",
                 "data": {"phase": "failed", "error": str(e)}
             })
+            record_metrics(job_dir, {"final_status": "failed", "error": str(e)[:500]})
             traceback.print_exc()
 
         except Exception as e:
@@ -281,9 +326,11 @@ class JobManager:
                 "event": "job_error",
                 "data": {"phase": "failed", "error": str(e)}
             })
+            record_metrics(job_dir, {"final_status": "failed", "error": f"{type(e).__name__}: {str(e)[:500]}"})
             traceback.print_exc()
 
         finally:
+            record_duration(job_dir, "job_total_sec", job_started)
             # Clean up to prevent memory leak
             self._tasks.pop(job_id, None)
             self._subscribers.pop(job_id, None)
@@ -292,12 +339,75 @@ class JobManager:
     def _clean_generated_outputs(self, job_dir: str):
         """Remove stale generated artifacts before retrying an existing job."""
         shutil.rmtree(os.path.join(job_dir, "frames"), ignore_errors=True)
-        for name in ("shots.json", "audio_analysis.json", "audio.wav", "transcript.json", "report.md"):
+        for name in ("shots.json", "audio_analysis.json", "audio.wav", "transcript.json", "report.md", "performance.json"):
             path = os.path.join(job_dir, name)
             try:
                 os.remove(path)
             except FileNotFoundError:
                 pass
+
+    def _clean_report_only(self, job_dir: str):
+        try:
+            os.remove(os.path.join(job_dir, "report.md"))
+        except FileNotFoundError:
+            pass
+
+    async def _load_resume_data(self, job_id: str, job_dir: str):
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Job).where(Job.id == job_id))
+            job = result.scalar_one_or_none()
+            if not job or job.status not in ("failed", "partial_completed"):
+                return None
+
+            result = await db.execute(
+                select(Shot)
+                .where(Shot.job_id == job_id)
+                .order_by(Shot.shot_number)
+            )
+            shot_rows = result.scalars().all()
+
+        if not shot_rows:
+            return None
+
+        transcript_path = os.path.join(job_dir, "transcript.json")
+        audio_analysis_path = os.path.join(job_dir, "audio_analysis.json")
+        if not os.path.exists(transcript_path) or not os.path.exists(audio_analysis_path):
+            return None
+
+        all_shots = [self._shot_to_run_dict(shot) for shot in shot_rows]
+        shots_to_analyze = [
+            self._shot_to_run_dict(shot)
+            for shot in shot_rows
+            if shot.status != "completed"
+        ]
+
+        if any(not self._has_analysis_frame(job_dir, shot["shot_number"]) for shot in shots_to_analyze):
+            return None
+
+        transcript = self._read_json_file(transcript_path, [])
+        audio_analysis = self._read_json_file(audio_analysis_path, {})
+        return all_shots, shots_to_analyze, transcript, audio_analysis
+
+    def _shot_to_run_dict(self, shot: Shot) -> dict:
+        return {
+            "shot_number": shot.shot_number,
+            "start_time_sec": shot.start_time_sec,
+            "end_time_sec": shot.end_time_sec,
+            "duration_sec": shot.end_time_sec - shot.start_time_sec,
+            "keyframe_paths": shot.keyframe_paths,
+        }
+
+    def _has_analysis_frame(self, job_dir: str, shot_number: int) -> bool:
+        return os.path.exists(
+            os.path.join(job_dir, "frames", f"shot_{shot_number:04d}", "frame_start.jpg")
+        )
+
+    def _read_json_file(self, path: str, default):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return default
 
 
 job_manager = JobManager()

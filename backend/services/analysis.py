@@ -1,15 +1,25 @@
+from __future__ import annotations
+
 import json
 import os
 import base64
 import asyncio
 import sys
+import random
+from io import BytesIO
 from collections.abc import Callable
 from typing import Optional
+import httpx
+from PIL import Image
 from sqlalchemy import select
-from backend.config import JOBS_DIR, BATCH_SIZE
+from backend.config import JOBS_DIR, BATCH_SIZE, ANALYSIS_CONCURRENCY, ANALYSIS_IMAGE_MAX_SIDE, ANALYSIS_IMAGE_JPEG_QUALITY
 from backend.database import AsyncSessionLocal
 from backend.models import Shot
-from backend.services.api_runner import analyze_one_shot
+from backend.services.api_runner import ApiRunnerError, analyze_one_shot, get_analysis_api_config
+
+
+_analysis_semaphore: asyncio.Semaphore | None = None
+_analysis_semaphore_loop: asyncio.AbstractEventLoop | None = None
 
 
 class AnalysisService:
@@ -26,75 +36,75 @@ class AnalysisService:
         audio_text = self._format_audio(audio_analysis)
 
         template = _load_prompt_template("cinematography.md")
+        api_config = await get_analysis_api_config()
 
-        for batch_idx in range(0, len(shots), BATCH_SIZE):
-            self._raise_if_cancelled(cancel_check)
-            batch_shots = shots[batch_idx:batch_idx + BATCH_SIZE]
-            batch_id = batch_idx // BATCH_SIZE + 1
-            shot_numbers = [s["shot_number"] for s in batch_shots]
-
-            await queue.put({
-                "event": "shot_start",
-                "data": {"batch": batch_id, "total_batches": total_batches, "shot_numbers": shot_numbers}
-            })
-
-            async def analyze_shot(shot: dict) -> dict:
+        async with httpx.AsyncClient(timeout=600) as client:
+            for batch_idx in range(0, len(shots), BATCH_SIZE):
                 self._raise_if_cancelled(cancel_check)
-                sn = shot["shot_number"]
-                dur = shot.get("duration_sec", shot["end_time_sec"] - shot["start_time_sec"])
-                features = shot.get("frame_features") or {}
-                flow = shot.get("optical_flow", {})
+                batch_shots = shots[batch_idx:batch_idx + BATCH_SIZE]
+                batch_id = batch_idx // BATCH_SIZE + 1
+                shot_numbers = [s["shot_number"] for s in batch_shots]
 
-                shot_info = f"## SHOT {sn} (时长 {dur:.1f}s)\n"
-                shot_info += f"数值特征: {_format_features(features)}\n"
-                shot_info += f"运镜数据: 前半段={flow.get('前半段', 'N/A')}, 后半段={flow.get('后半段', 'N/A')}"
+                await queue.put({
+                    "event": "shot_start",
+                    "data": {"batch": batch_id, "total_batches": total_batches, "shot_numbers": shot_numbers}
+                })
 
-                prompt_text = template.replace("{SHOTS}", shot_info)
-                prompt_text = prompt_text.replace("{AUDIO}", audio_text)
-                prompt_text = prompt_text.replace("{TRANSCRIPT}", full_transcript[:3000])
+                async def analyze_shot(shot: dict) -> dict:
+                    self._raise_if_cancelled(cancel_check)
+                    sn = shot["shot_number"]
+                    dur = shot.get("duration_sec", shot["end_time_sec"] - shot["start_time_sec"])
+                    features = shot.get("frame_features") or {}
+                    flow = shot.get("optical_flow", {})
 
-                # Encode all 3 keyframes (start, mid, end) — offload file I/O
-                content = await asyncio.to_thread(
-                    _load_keyframe_images, job_dir, sn
+                    shot_info = f"## SHOT {sn} (时长 {dur:.1f}s)\n"
+                    shot_info += f"数值特征: {_format_features(features)}\n"
+                    shot_info += f"运镜数据: 前半段={flow.get('前半段', 'N/A')}, 后半段={flow.get('后半段', 'N/A')}"
+
+                    prompt_text = template.replace("{SHOTS}", shot_info)
+                    prompt_text = prompt_text.replace("{AUDIO}", audio_text)
+                    prompt_text = prompt_text.replace("{TRANSCRIPT}", full_transcript[:3000])
+
+                    content = await asyncio.to_thread(_load_keyframe_images, job_dir, sn)
+                    content.append({"type": "text", "text": prompt_text})
+
+                    last_err = None
+                    for attempt in range(3):
+                        try:
+                            self._raise_if_cancelled(cancel_check)
+                            async with _get_analysis_semaphore():
+                                return await analyze_one_shot(sn, content, queue, client=client, api_config=api_config)
+                        except Exception as e:
+                            last_err = e
+                            if attempt >= 2 or not _is_retryable_api_error(e):
+                                raise
+                            await asyncio.sleep(_retry_delay(e, attempt))
+                    raise last_err
+
+                results = await asyncio.gather(
+                    *[analyze_shot(s) for s in batch_shots],
+                    return_exceptions=True,
                 )
-                content.append({"type": "text", "text": prompt_text})
 
-                # Retry up to 2 times
-                last_err = None
-                for attempt in range(3):
-                    try:
-                        self._raise_if_cancelled(cancel_check)
-                        return await analyze_one_shot(sn, content, queue)
-                    except Exception as e:
-                        last_err = e
-                        if attempt < 2:
-                            await asyncio.sleep(3)
-                raise last_err
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        shot_num = batch_shots[i]["shot_number"]
+                        await self._mark_failed(job_id, shot_num, str(result))
+                        await queue.put({
+                            "event": "shot_error",
+                            "data": {"shot_number": shot_num, "error": str(result)[:200]}
+                        })
+                        continue
+                    if result and result.get("shots"):
+                        await self._save_batch(job_id, result, queue)
 
-            results = await asyncio.gather(
-                *[analyze_shot(s) for s in batch_shots],
-                return_exceptions=True,
-            )
-
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    shot_num = batch_shots[i]["shot_number"]
-                    await self._mark_failed(job_id, shot_num, str(result))
-                    await queue.put({
-                        "event": "shot_error",
-                        "data": {"shot_number": shot_num, "error": str(result)[:200]}
-                    })
-                    continue
-                if result and result.get("shots"):
-                    await self._save_batch(job_id, result, queue)
-
-            progress = 0.3 + 0.7 * (batch_id / total_batches)
-            async with AsyncSessionLocal() as db:
-                from backend.models import Job
-                result_db = await db.execute(select(Job).where(Job.id == job_id))
-                job = result_db.scalar_one()
-                job.progress = progress
-                await db.commit()
+                progress = 0.3 + 0.7 * (batch_id / total_batches)
+                async with AsyncSessionLocal() as db:
+                    from backend.models import Job
+                    result_db = await db.execute(select(Job).where(Job.id == job_id))
+                    job = result_db.scalar_one()
+                    job.progress = progress
+                    await db.commit()
 
     def _raise_if_cancelled(self, cancel_check: Optional[Callable[[], bool]]):
         if cancel_check and cancel_check():
@@ -160,13 +170,54 @@ def _load_keyframe_images(job_dir: str, shot_number: int) -> list[dict]:
     for fn in ["frame_start.jpg", "frame_mid.jpg", "frame_end.jpg"]:
         fp = os.path.join(frame_dir, fn)
         if os.path.exists(fp):
-            with open(fp, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode()
+            img_b64 = _encode_keyframe_for_analysis(fp)
             content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
             })
     return content
+
+
+def _get_analysis_semaphore() -> asyncio.Semaphore:
+    global _analysis_semaphore, _analysis_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _analysis_semaphore is None or _analysis_semaphore_loop is not loop:
+        _analysis_semaphore = asyncio.Semaphore(max(1, ANALYSIS_CONCURRENCY))
+        _analysis_semaphore_loop = loop
+    return _analysis_semaphore
+
+
+def _is_retryable_api_error(error: Exception) -> bool:
+    if isinstance(error, ApiRunnerError):
+        if error.status_code is None:
+            return False
+        return error.status_code in {408, 409, 425, 429} or 500 <= error.status_code < 600
+    return isinstance(error, (httpx.TimeoutException, httpx.TransportError))
+
+
+def _retry_delay(error: Exception, attempt: int) -> float:
+    if isinstance(error, ApiRunnerError) and error.retry_after is not None:
+        return min(error.retry_after, 30.0)
+    return min(12.0, (2 ** attempt) + random.random())
+
+
+def _encode_keyframe_for_analysis(image_path: str) -> str:
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            img.thumbnail((ANALYSIS_IMAGE_MAX_SIDE, ANALYSIS_IMAGE_MAX_SIDE), resampling)
+            buffer = BytesIO()
+            img.save(
+                buffer,
+                format="JPEG",
+                quality=ANALYSIS_IMAGE_JPEG_QUALITY,
+                optimize=True,
+            )
+        return base64.b64encode(buffer.getvalue()).decode()
+    except Exception:
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
 
 
 def _load_prompt_template(filename: str) -> str:

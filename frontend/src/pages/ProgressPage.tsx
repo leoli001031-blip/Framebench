@@ -1,16 +1,18 @@
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useMemo, useRef } from "react"
 import { useParams, useNavigate } from "react-router-dom"
-import { getJob, startJob } from "@/lib/api"
+import { getJobProgress, startJob } from "@/lib/api"
 import { mapJobStatus } from "@/lib/constants"
 import { useSSE } from "@/hooks/useSSE"
-import type { JobDetail } from "@/types"
+import type { JobProgress } from "@/types"
 import ShotCard from "@/components/ShotCard"
 import JobCard from "@/components/JobCard"
+
+const SHOT_PAGE_SIZE = 120
 
 export default function ProgressPage() {
   const { jobId } = useParams<{ jobId: string }>()
   const navigate = useNavigate()
-  const [job, setJob] = useState<JobDetail | null>(null)
+  const [job, setJob] = useState<JobProgress | null>(null)
   const [preprocessMsg, setPreprocessMsg] = useState("")
   const [preprocessStep, setPreprocessStep] = useState("")
   const [thinking, setThinking] = useState("")
@@ -18,18 +20,48 @@ export default function ProgressPage() {
   const [failedShots, setFailedShots] = useState<Set<number>>(new Set())
   const [error, setError] = useState("")
   const [elapsedSec, setElapsedSec] = useState(0)
+  const [loadingMoreShots, setLoadingMoreShots] = useState(false)
   const startedRef = useRef(false)
   const runningSinceRef = useRef<number | null>(null)
+  const pendingThinkingRef = useRef("")
+  const thinkingFrameRef = useRef<number | null>(null)
+
+  const cancelPendingThinking = () => {
+    if (thinkingFrameRef.current != null) {
+      window.cancelAnimationFrame(thinkingFrameRef.current)
+      thinkingFrameRef.current = null
+    }
+    pendingThinkingRef.current = ""
+  }
+
+  const queueThinkingUpdate = (text: string) => {
+    pendingThinkingRef.current = text
+    if (thinkingFrameRef.current != null) return
+    thinkingFrameRef.current = window.requestAnimationFrame(() => {
+      thinkingFrameRef.current = null
+      setThinking(pendingThinkingRef.current)
+    })
+  }
+
+  useEffect(() => () => {
+    if (thinkingFrameRef.current != null) {
+      window.cancelAnimationFrame(thinkingFrameRef.current)
+      thinkingFrameRef.current = null
+    }
+    pendingThinkingRef.current = ""
+  }, [])
 
   useEffect(() => {
     if (!jobId) return
     startedRef.current = false
     runningSinceRef.current = null
-    getJob(jobId)
+    getJobProgress(jobId, { includeShots: true, shotLimit: SHOT_PAGE_SIZE })
       .then((nextJob) => {
         setCompletedShots(new Set())
         setFailedShots(new Set())
         setElapsedSec(0)
+        setLoadingMoreShots(false)
+        cancelPendingThinking()
         setJob(nextJob)
       })
       .catch((e) => setError(e instanceof Error ? e.message : "加载失败"))
@@ -66,6 +98,7 @@ export default function ProgressPage() {
     setError("")
     setPreprocessMsg("")
     setPreprocessStep("")
+    cancelPendingThinking()
     setThinking("")
     setCompletedShots(new Set())
     setFailedShots(new Set())
@@ -94,7 +127,7 @@ export default function ProgressPage() {
       if (typeof sn !== "number" || !Number.isFinite(sn) || sn < 1) return
       setCompletedShots((prev) => new Set(prev).add(sn))
     },
-    onThinking: (data) => { setThinking(data.text as string) },
+    onThinking: (data) => { queueThinkingUpdate(data.text as string) },
     onComplete: () => { setJob((prev) => prev ? { ...prev, status: "completed" } : null) },
     onError: (data) => {
       const sn = data.shot_number as number
@@ -104,22 +137,66 @@ export default function ProgressPage() {
       }
       setJob((prev) => prev ? { ...prev, status: "failed", error_message: data.error as string } : null)
     },
-    onDone: () => { if (jobId) getJob(jobId).then(setJob).catch((e) => setError(e instanceof Error ? e.message : "加载失败")) },
+    onDone: () => {
+      if (!jobId) return
+      getJobProgress(jobId, { includeShots: true, shotLimit: Math.max(SHOT_PAGE_SIZE, job?.shots.length || 0) })
+        .then(setJob)
+        .catch((e) => setError(e instanceof Error ? e.message : "加载失败"))
+    },
   })
 
-  const savedCompletedShots = new Set(job?.shots.filter((shot) => shot.status === "completed").map((shot) => shot.shot_number) || [])
-  const savedFailedShots = new Set(job?.shots.filter((shot) => shot.status === "failed").map((shot) => shot.shot_number) || [])
-  const totalShots = job?.total_shots || job?.shots.length || 0
-  const completedCount = Math.max(completedShots.size, savedCompletedShots.size)
-  const failedCount = Math.max(failedShots.size, savedFailedShots.size)
+  const savedCompletedShots = useMemo(
+    () => new Set(job?.shots.filter((shot) => shot.status === "completed").map((shot) => shot.shot_number) || []),
+    [job?.shots],
+  )
+  const savedFailedShots = useMemo(
+    () => new Set(job?.shots.filter((shot) => shot.status === "failed").map((shot) => shot.shot_number) || []),
+    [job?.shots],
+  )
+  const totalShots = job?.shots_total || job?.total_shots || job?.shots.length || 0
+  const completedCount = Math.min(
+    totalShots || Number.MAX_SAFE_INTEGER,
+    Math.max(job?.completed_shots || 0, savedCompletedShots.size) + completedShots.size,
+  )
+  const failedCount = Math.min(
+    totalShots || Number.MAX_SAFE_INTEGER,
+    Math.max(job?.failed_shots || 0, savedFailedShots.size) + failedShots.size,
+  )
   const progressPct = totalShots > 0 ? Math.min(100, Math.round(((completedCount + failedCount) / totalShots) * 100)) : Math.round((job?.progress || 0) * 100)
   const runningLabel = job?.status === "preprocessing" || job?.status === "preprocessing_done" ? "准备素材" : job?.status === "analyzing" ? "逐镜分析" : job?.status === "cancelling" ? "取消中" : job?.status === "partial_completed" ? "部分完成" : job?.status === "completed" ? "完成" : job?.status === "failed" ? "已中断" : "等待"
+
+  const loadMoreShots = async () => {
+    if (!jobId || !job || loadingMoreShots) return
+    setLoadingMoreShots(true)
+    try {
+      const nextPage = await getJobProgress(jobId, {
+        includeShots: true,
+        shotLimit: SHOT_PAGE_SIZE,
+        shotOffset: job.shots.length,
+      })
+      setJob((prev) => {
+        if (!prev) return nextPage
+        const seen = new Set(prev.shots.map((shot) => shot.id))
+        return {
+          ...nextPage,
+          shots: [
+            ...prev.shots,
+            ...nextPage.shots.filter((shot) => !seen.has(shot.id)),
+          ],
+        }
+      })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "加载失败")
+    } finally {
+      setLoadingMoreShots(false)
+    }
+  }
 
   const getConclusion = () => {
     if (error || job?.error_message) return `分析遇到问题: ${error || job?.error_message}`
     if (job?.status === "partial_completed") return "部分镜头已完成，报告可先查看；未完成镜头可稍后重试。"
     if (job?.status === "completed") return "分析已完成，报告已生成。"
-    if (job?.status === "analyzing") return `正在深入分析镜头内容... (${completedShots.size}/${job.total_shots || "?"})`
+    if (job?.status === "analyzing") return `正在深入分析镜头内容... (${completedCount}/${totalShots || "?"})`
     if (job?.status === "preprocessing") return `正在准备视频资源: ${preprocessMsg || "加载中"}`
     return "正在排队，请稍候。"
   }
@@ -188,13 +265,26 @@ export default function ProgressPage() {
         <div className="mt-8 space-y-4">
           <div className="flex items-center justify-between px-1">
             <h3 className="text-xs font-medium text-muted/80 tracking-wider uppercase">分析详情</h3>
-            <span className="text-[10px] text-muted/40">{completedCount} / {totalShots || job.shots.length}</span>
+            <span className="text-[10px] text-muted/40">{job.shots.length} / {totalShots || job.shots.length}</span>
           </div>
           <div className="space-y-1">
             {job.shots.map((shot) => (
-              <ShotCard key={shot.id} shot={shot} isComplete={completedShots.has(shot.shot_number) || savedCompletedShots.has(shot.shot_number)} />
+              <div key={shot.id} className="perf-row-sm">
+                <ShotCard shot={shot} isComplete={completedShots.has(shot.shot_number) || savedCompletedShots.has(shot.shot_number)} />
+              </div>
             ))}
           </div>
+          {job.shots_truncated && (
+            <div className="pt-3 text-center">
+              <button
+                onClick={loadMoreShots}
+                disabled={loadingMoreShots}
+                className="px-3 py-1.5 text-[10px] font-bold text-primary/60 hover:text-primary disabled:text-muted/25 transition-colors uppercase tracking-widest"
+              >
+                {loadingMoreShots ? "正在加载" : "加载更多镜头"}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

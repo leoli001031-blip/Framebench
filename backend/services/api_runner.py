@@ -2,10 +2,35 @@
 Moonshot API (Kimi K2.6) async runner for vision-based shot analysis.
 Sends HTTP POST with base64-encoded keyframe images + prompt.
 """
+from __future__ import annotations
+
 import asyncio
+from dataclasses import dataclass
 import json
 import httpx
 from backend.database import get_system_setting
+
+
+@dataclass(frozen=True)
+class AnalysisApiConfig:
+    model: str
+    base_url: str
+    api_key: str
+
+
+class ApiRunnerError(RuntimeError):
+    def __init__(self, message: str, status_code: int | None = None, retry_after: float | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+async def get_analysis_api_config() -> AnalysisApiConfig:
+    return AnalysisApiConfig(
+        model=await get_system_setting("analysis_model", "kimi-k2.6"),
+        base_url=(await get_system_setting("analysis_base_url", "https://api.moonshot.cn/v1")).rstrip("/"),
+        api_key=await get_system_setting("analysis_api_key"),
+    )
 
 
 async def analyze_one_shot(
@@ -13,27 +38,32 @@ async def analyze_one_shot(
     content: list[dict],
     queue: asyncio.Queue,
     timeout: int = 600,
+    client: httpx.AsyncClient | None = None,
+    api_config: AnalysisApiConfig | None = None,
 ) -> dict:
     """Analyze a single shot via Moonshot API. Returns parsed result dict."""
+    config = api_config or await get_analysis_api_config()
+    if not config.api_key:
+        raise ApiRunnerError(f"API key missing on shot {shot_number}", status_code=401)
+
     payload = {
-        "model": await get_system_setting("analysis_model", "kimi-k2.6"),
+        "model": config.model,
         "max_tokens": 8000,
         "messages": [{"role": "user", "content": content}],
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            f"{await get_system_setting('analysis_base_url', 'https://api.moonshot.cn/v1')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {await get_system_setting('analysis_api_key')}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+    if client is None:
+        async with httpx.AsyncClient(timeout=timeout) as local_client:
+            resp = await _post_chat_completion(local_client, config, payload)
+    else:
+        resp = await _post_chat_completion(client, config, payload)
 
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"API error {resp.status_code} on shot {shot_number}: {resp.text[:300]}"
+        retry_after = _parse_retry_after(resp.headers.get("retry-after"))
+        raise ApiRunnerError(
+            f"API error {resp.status_code} on shot {shot_number}: {resp.text[:300]}",
+            status_code=resp.status_code,
+            retry_after=retry_after,
         )
 
     data = resp.json()
@@ -55,6 +85,26 @@ async def analyze_one_shot(
         if "shot_number" not in s:
             s["shot_number"] = shot_number
     return parsed
+
+
+async def _post_chat_completion(client: httpx.AsyncClient, config: AnalysisApiConfig, payload: dict) -> httpx.Response:
+    return await client.post(
+        f"{config.base_url}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
 
 
 def _parse_json_output(result_text: str) -> dict:

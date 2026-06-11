@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useMemo } from "react"
 import { useNavigate } from "react-router-dom"
 import { listJobs, updateJob, deleteJob, listCategories } from "@/lib/api"
 import StatusBean from "@/components/StatusBean"
@@ -66,18 +66,18 @@ export default function LibraryPage() {
     if (activeCategory === cat) setActiveCategory("全部")
   }
 
-  const completedJobs = jobs.filter((j) => j.status === "completed")
-  const filteredJobs = completedJobs.filter((j) => {
-    if (activeCategory !== "全部" && j.category !== activeCategory) return false
-    return true
-  })
-
-  const groups: Record<string, JobInfo[]> = {}
-  filteredJobs.forEach(job => {
-    const cat = job.category || "未分类"
-    if (!groups[cat]) groups[cat] = []
-    groups[cat].push(job)
-  })
+  const groups = useMemo(() => {
+    const next: Record<string, JobInfo[]> = {}
+    jobs
+      .filter((j) => j.status === "completed")
+      .filter((j) => activeCategory === "全部" || j.category === activeCategory)
+      .forEach((job) => {
+        const cat = job.category || "未分类"
+        if (!next[cat]) next[cat] = []
+        next[cat].push(job)
+      })
+    return next
+  }, [activeCategory, jobs])
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -163,7 +163,7 @@ export default function LibraryPage() {
                   status={<StatusBean type={mapJobStatus(job.status)} />}
                   time={job.total_shots ? `${job.total_shots} 镜头` : undefined}
                   onClick={() => navigate(`/jobs/${job.id}`)}
-                  className="hover:bg-surface/80 hover:shadow-[0_10px_30px_-5px_rgba(47,39,34,0.05)] py-4 rounded-xl border border-transparent hover:border-line/5 transition-all duration-500"
+                  className="perf-row-sm hover:bg-surface/80 hover:shadow-[0_10px_30px_-5px_rgba(47,39,34,0.05)] py-4 rounded-xl border border-transparent hover:border-line/5 transition-colors duration-500"
                   action={
                     <div className="flex items-center gap-6" onClick={(e) => e.stopPropagation()}>
                       <select

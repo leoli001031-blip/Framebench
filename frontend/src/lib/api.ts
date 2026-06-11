@@ -1,4 +1,4 @@
-import type { JobInfo, JobDetail, CategoryList, StoryboardResult, StoryboardHistoryItem, StoryboardDetail, StoryboardGenerationTask, SystemSettingResponse } from "@/types"
+import type { JobInfo, JobDetail, JobSummary, JobShotsPage, JobProgress, CategoryList, StoryboardResult, StoryboardHistoryItem, StoryboardDetail, StoryboardGenerationTask, SystemSettingResponse } from "@/types"
 import { getApiBase, withAuthHeaders, withAuthQuery } from "@/lib/runtime"
 
 const BASE = getApiBase()
@@ -32,8 +32,17 @@ export async function startJob(jobId: string): Promise<{ job_id: string; status:
   return res.json()
 }
 
-export async function listJobs(): Promise<JobInfo[]> {
-  const res = await apiFetch("/jobs")
+function toQuery(params: Record<string, string | number | boolean | undefined>): string {
+  const query = new URLSearchParams()
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined) query.set(key, String(value))
+  })
+  const text = query.toString()
+  return text ? `?${text}` : ""
+}
+
+export async function listJobs(options: { limit?: number; offset?: number } = {}): Promise<JobInfo[]> {
+  const res = await apiFetch(`/jobs${toQuery(options)}`)
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "List jobs failed")
   return res.json()
 }
@@ -41,6 +50,31 @@ export async function listJobs(): Promise<JobInfo[]> {
 export async function getJob(jobId: string): Promise<JobDetail> {
   const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}`)
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "Get job failed")
+  return res.json()
+}
+
+export async function getJobSummary(jobId: string): Promise<JobSummary> {
+  const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}/summary`)
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Get job summary failed")
+  return res.json()
+}
+
+export async function getJobShots(jobId: string, options: { limit?: number; offset?: number } = {}): Promise<JobShotsPage> {
+  const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}/shots${toQuery(options)}`)
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Get job shots failed")
+  return res.json()
+}
+
+export async function getJobProgress(
+  jobId: string,
+  options: { includeShots?: boolean; shotLimit?: number; shotOffset?: number } = {},
+): Promise<JobProgress> {
+  const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}/progress${toQuery({
+    include_shots: options.includeShots,
+    shot_limit: options.shotLimit,
+    shot_offset: options.shotOffset,
+  })}`)
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Get job progress failed")
   return res.json()
 }
 
@@ -188,8 +222,8 @@ export function getSSEUrl(jobId: string): string {
   return withAuthQuery(`${BASE}/jobs/${encodeURIComponent(jobId)}/sse`)
 }
 
-export async function listStoryboards(): Promise<StoryboardHistoryItem[]> {
-  const res = await apiFetch("/storyboards")
+export async function listStoryboards(options: { limit?: number; offset?: number } = {}): Promise<StoryboardHistoryItem[]> {
+  const res = await apiFetch(`/storyboards${toQuery(options)}`)
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "List storyboards failed")
   return res.json()
 }

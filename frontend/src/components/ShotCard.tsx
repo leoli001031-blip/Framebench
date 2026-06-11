@@ -1,12 +1,13 @@
-import type { ShotInfo } from "@/types"
+import { memo } from "react"
+import type { ShotProgressInfo } from "@/types"
 import { getFrameUrl } from "@/lib/utils"
 
 interface Props {
-  shot: ShotInfo
+  shot: ShotProgressInfo
   isComplete: boolean
 }
 
-export default function ShotCard({ shot, isComplete }: Props) {
+function ShotCard({ shot, isComplete }: Props) {
   const frameUrl = getFrameUrl(shot.keyframe_paths)
 
   return (
@@ -16,7 +17,13 @@ export default function ShotCard({ shot, isComplete }: Props) {
       {/* Icon/Thumbnail area */}
       <div className="w-10 h-7 rounded bg-primary-soft/30 overflow-hidden flex-shrink-0 border border-line/10">
         {frameUrl ? (
-          <img src={frameUrl} alt={`镜${shot.shot_number}`} className="w-full h-full object-cover" />
+          <img
+            src={frameUrl}
+            alt={`镜${shot.shot_number}`}
+            loading="lazy"
+            decoding="async"
+            className="w-full h-full object-cover"
+          />
         ) : (
           <div className="w-full h-full flex items-center justify-center text-[8px] text-muted/40">
             {isComplete ? "无图" : "..."}
@@ -46,3 +53,4 @@ export default function ShotCard({ shot, isComplete }: Props) {
   )
 }
 
+export default memo(ShotCard)

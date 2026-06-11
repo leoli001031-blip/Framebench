@@ -21,6 +21,39 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+        from sqlalchemy import text
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_category ON jobs(category)",
+            "CREATE INDEX IF NOT EXISTS idx_shots_job_status ON shots(job_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_storyboards_created_at ON storyboards(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_storyboard_shots_storyboard_id ON storyboard_shots(storyboard_id)",
+            "CREATE INDEX IF NOT EXISTS idx_storyboard_shots_storyboard_number ON storyboard_shots(storyboard_id, shot_number)",
+            "CREATE INDEX IF NOT EXISTS idx_storyboard_generation_tasks_created_at ON storyboard_generation_tasks(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_dimensions_shot_id ON dimensions(shot_id)",
+            "CREATE INDEX IF NOT EXISTS idx_transcript_segments_job_id ON transcript_segments(job_id)",
+        ):
+            await conn.execute(text(statement))
+
+        from backend.config import MOONSHOT_API_KEY, MOONSHOT_MODEL, MOONSHOT_BASE_URL
+        defaults = [
+            ("analysis_api_key", MOONSHOT_API_KEY, "分析引擎 API 密钥"),
+            ("analysis_model", MOONSHOT_MODEL, "分析引擎模型名称"),
+            ("analysis_base_url", MOONSHOT_BASE_URL, "分析引擎接口地址"),
+            ("storyboard_api_key", MOONSHOT_API_KEY, "分镜引擎 API 密钥"),
+            ("storyboard_model", MOONSHOT_MODEL, "分镜引擎模型名称"),
+            ("storyboard_base_url", MOONSHOT_BASE_URL, "分镜引擎接口地址"),
+        ]
+        for key, value, description in defaults:
+            await conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO system_settings (key, value, description, updated_at) "
+                    "VALUES (:key, :value, :description, CURRENT_TIMESTAMP)"
+                ),
+                {"key": key, "value": value, "description": description},
+            )
+
     # Reset any stuck jobs (analyzing/preprocessing -> failed)
     from backend.models import Job, StoryboardGenerationTask, _now
     from sqlalchemy import update

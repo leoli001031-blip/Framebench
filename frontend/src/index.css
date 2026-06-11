@@ -43,3 +43,21 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--color-muted);
 }
+
+.perf-row,
+.perf-row-sm,
+.perf-row-lg {
+  content-visibility: auto;
+}
+
+.perf-row {
+  contain-intrinsic-size: 1px 280px;
+}
+
+.perf-row-sm {
+  contain-intrinsic-size: 1px 72px;
+}
+
+.perf-row-lg {
+  contain-intrinsic-size: 1px 420px;
+}

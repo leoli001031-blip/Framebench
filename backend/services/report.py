@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from collections import defaultdict
 from sqlalchemy import select
 from backend.config import JOBS_DIR
 from backend.database import AsyncSessionLocal
@@ -46,6 +47,9 @@ async def build_report(job_id: str) -> str:
                 dim_counts[dim.dimension_name] = {"labels": {}}
             label = dim.label or "unknown"
             dim_counts[dim.dimension_name]["labels"][label] = dim_counts[dim.dimension_name]["labels"].get(label, 0) + 1
+        dimensions_by_shot_id = defaultdict(list)
+        for dim in dimensions:
+            dimensions_by_shot_id[dim.shot_id].append(dim)
 
         for dim_name in all_dims:
             if dim_name in dim_counts:
@@ -77,7 +81,7 @@ async def build_report(job_id: str) -> str:
 
             # Dimension details
             shot_dims = sorted(
-                [d for d in dimensions if d.shot_id == shot.id],
+                dimensions_by_shot_id.get(shot.id, []),
                 key=lambda d: all_dims.index(d.dimension_name) if d.dimension_name in all_dims else 99
             )
             if shot_dims:
