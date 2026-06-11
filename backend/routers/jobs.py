@@ -73,6 +73,13 @@ def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
     return start, min(end, file_size - 1)
 
 
+def _get_playback_video_path(job_id: str, original_path: str) -> str:
+    playback_path = os.path.join(JOBS_DIR, job_id, "playback.mp4")
+    if os.path.exists(playback_path) and os.path.getsize(playback_path) > 0:
+        return playback_path
+    return original_path
+
+
 def validate_job_id(job_id: str) -> str:
     """Validate that job_id is a UUID to prevent path traversal."""
     try:
@@ -418,10 +425,11 @@ async def get_job_video(job_id: str, request: Request, db: AsyncSession = Depend
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(404, "Job not found")
-    if not os.path.exists(job.video_path):
+    video_path = _get_playback_video_path(job_id, job.video_path)
+    if not os.path.exists(video_path):
         raise HTTPException(404, "Video file not found")
 
-    file_size = os.path.getsize(job.video_path)
+    file_size = os.path.getsize(video_path)
     range_header = request.headers.get("range")
     headers = {
         "Accept-Ranges": "bytes",
@@ -443,14 +451,14 @@ async def get_job_video(job_id: str, request: Request, db: AsyncSession = Depend
             "Content-Length": str(end - start + 1),
         })
         return StreamingResponse(
-            _iter_file_range(job.video_path, start, end),
+            _iter_file_range(video_path, start, end),
             status_code=206,
             headers=headers,
         )
 
     headers["Content-Length"] = str(file_size)
     return StreamingResponse(
-        _iter_file_range(job.video_path, 0, file_size - 1),
+        _iter_file_range(video_path, 0, file_size - 1),
         headers=headers,
     )
 

@@ -63,6 +63,15 @@ class Preprocessor:
         self._raise_if_cancelled(cancel_check)
         self._save_audio_analysis(job_dir, audio_analysis)
 
+        await queue.put({
+            "event": "status",
+            "data": {"phase": "preprocessing", "step": "playback_video", "message": "Preparing playback video..."}
+        })
+        phase_started = perf_now()
+        playback_created = await asyncio.to_thread(self._ensure_playback_video, video_path, job_dir)
+        record_duration(job_dir, "playback_video_sec", phase_started, {"playback_video_created": playback_created})
+        self._raise_if_cancelled(cancel_check)
+
         # Step 3: Extract keyframes + optical flow
         await queue.put({
             "event": "status",
@@ -196,6 +205,52 @@ class Preprocessor:
         path = os.path.join(job_dir, "audio_analysis.json")
         with open(path, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def _ensure_playback_video(self, video_path: str, job_dir: str) -> bool:
+        if self._get_video_codec(video_path) == "h264":
+            return False
+
+        playback_path = os.path.join(job_dir, "playback.mp4")
+        if os.path.exists(playback_path) and os.path.getsize(playback_path) > 0:
+            return True
+
+        tmp_path = os.path.join(job_dir, "playback.tmp.mp4")
+        result = subprocess.run(
+            [
+                FFMPEG_BIN, "-y", "-i", video_path,
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-vf", "scale='min(1280,iw)':-2",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                tmp_path,
+            ],
+            capture_output=True, text=True, timeout=1800,
+        )
+        if result.returncode != 0:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return False
+
+        os.replace(tmp_path, playback_path)
+        return True
+
+    def _get_video_codec(self, video_path: str) -> str:
+        result = subprocess.run(
+            [
+                FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip().lower()
 
     def _extract_frame(self, video_path: str, output_path: str, time_sec: float):
         result = subprocess.run(
