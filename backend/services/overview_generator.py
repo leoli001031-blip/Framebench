@@ -1,11 +1,24 @@
 """Generate a holistic director's overview after all shots are analyzed."""
+import asyncio
 import json
+from time import perf_counter
 import httpx
 from backend.database import get_system_setting
+from backend.services.model_calls import record_model_call
+from backend.services.model_retry import ModelRequestError, is_retryable_model_error, parse_retry_after
+from backend.services.token_usage import try_append_token_usage
+
+
+class OverviewGenerationError(ModelRequestError):
+    pass
 
 
 async def generate_overview(
-    shots: list[dict], audio_analysis: dict, transcript_segments: list[dict]
+    shots: list[dict],
+    audio_analysis: dict,
+    transcript_segments: list[dict],
+    job_id: str | None = None,
+    attempt: int = 1,
 ) -> str:
     """Generate a director's overview from all shot analyses.
 
@@ -111,27 +124,113 @@ async def generate_overview(
 
 直接输出中文分析，不要标题，不要 JSON。"""
 
+    model = await get_system_setting("analysis_model", "step-3.7-flash")
     payload = {
-        "model": await get_system_setting("analysis_model", "kimi-k2.6"),
+        "model": model,
         "max_tokens": 8000,
         "messages": [{"role": "user", "content": prompt}],
     }
 
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(
-            f"{await get_system_setting('analysis_base_url', 'https://api.moonshot.cn/v1')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {await get_system_setting('analysis_api_key')}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
+    base_url = (await get_system_setting("analysis_base_url", "https://api.stepfun.com/v1")).rstrip("/")
+    api_key = await get_system_setting("analysis_api_key")
+    request_started = perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        await _record_overview_call(
+            job_id, model, attempt, "transport_error", None,
+            round((perf_counter() - request_started) * 1000),
+            is_retryable_model_error(exc), error=str(exc),
         )
+        raise
+
+    elapsed_ms = round((perf_counter() - request_started) * 1000)
 
     if resp.status_code != 200:
-        return f"[综述生成失败: API {resp.status_code}]"
+        error = OverviewGenerationError(
+            f"API {resp.status_code}: {resp.text[:200]}",
+            status_code=resp.status_code,
+            retry_after=parse_retry_after(resp.headers.get("retry-after")),
+        )
+        await _record_overview_call(
+            job_id, model, attempt, "http_error", resp.status_code,
+            elapsed_ms, is_retryable_model_error(error), error=str(error),
+        )
+        raise error
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        error = OverviewGenerationError("API returned invalid JSON")
+        await _record_overview_call(
+            job_id, model, attempt, "invalid_response", resp.status_code,
+            elapsed_ms, False, error=str(error),
+        )
+        raise error from exc
+    if job_id:
+        await asyncio.to_thread(
+            try_append_token_usage,
+            job_id,
+            source="overview",
+            model=model,
+            usage=data.get("usage") or {},
+        )
     choices = data.get("choices", [])
     if not choices:
-        return "[综述生成失败: API returned empty choices]"
-    return (choices[0].get("message", {}).get("content", "") or "").strip()
+        error = OverviewGenerationError("API returned empty choices")
+        await _record_overview_call(
+            job_id, model, attempt, "invalid_response", resp.status_code,
+            elapsed_ms, False, error=str(error),
+        )
+        raise error
+    content = (choices[0].get("message", {}).get("content", "") or "").strip()
+    if not content:
+        error = OverviewGenerationError("API returned empty overview")
+        await _record_overview_call(
+            job_id, model, attempt, "invalid_response", resp.status_code,
+            elapsed_ms, False, error=str(error),
+        )
+        raise error
+    await _record_overview_call(
+        job_id, model, attempt, "success", resp.status_code,
+        elapsed_ms, False, usage=data.get("usage") or {},
+    )
+    return content
+
+
+async def _record_overview_call(
+    job_id: str | None,
+    model: str,
+    attempt: int,
+    outcome: str,
+    status_code: int | None,
+    elapsed_ms: int,
+    retryable: bool,
+    *,
+    usage: dict | None = None,
+    error: str | None = None,
+):
+    if not job_id:
+        return
+    await asyncio.to_thread(
+        record_model_call,
+        "job",
+        job_id,
+        source="overview",
+        model=model,
+        attempt=attempt,
+        outcome=outcome,
+        status_code=status_code,
+        elapsed_ms=elapsed_ms,
+        retryable=retryable,
+        usage=usage,
+        error=error,
+    )

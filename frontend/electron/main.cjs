@@ -100,6 +100,12 @@ function waitForBackend(port, token, timeoutMs = 120000) {
 
   return new Promise((resolve, reject) => {
     const probe = () => {
+      let settled = false
+      const failOnce = () => {
+        if (settled) return
+        settled = true
+        retry()
+      }
       const req = http.get({
         host: "127.0.0.1",
         port,
@@ -109,17 +115,18 @@ function waitForBackend(port, token, timeoutMs = 120000) {
       }, (res) => {
         res.resume()
         if (res.statusCode === 200) {
+          settled = true
           resolve()
           return
         }
-        retry()
+        failOnce()
       })
 
       req.on("timeout", () => {
+        failOnce()
         req.destroy()
-        retry()
       })
-      req.on("error", retry)
+      req.on("error", failOnce)
     }
 
     const retry = () => {
@@ -185,6 +192,7 @@ async function startBackend() {
     cwd,
     stdio: "pipe",
     env,
+    detached: process.platform !== "win32",
   })
 
   backendProcess.stdout.on("data", (data) => {
@@ -211,8 +219,18 @@ async function startBackend() {
 
 function stopBackend() {
   if (backendProcess) {
-    backendProcess.kill("SIGTERM")
+    const processToStop = backendProcess
     backendProcess = null
+    try {
+      if (process.platform !== "win32" && processToStop.pid) {
+        process.kill(-processToStop.pid, "SIGTERM")
+      } else {
+        processToStop.kill("SIGTERM")
+      }
+    } catch (err) {
+      console.error("[backend] failed to stop process group:", err.message)
+      try { processToStop.kill("SIGTERM") } catch { /* process already exited */ }
+    }
   }
   if (backendLogStream) {
     backendLogStream.end()

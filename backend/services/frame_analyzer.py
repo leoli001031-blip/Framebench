@@ -4,14 +4,21 @@ import os
 from typing import Optional
 
 import numpy as np
-import cv2
 from PIL import Image
+
+
+_FRAME_ANALYSIS_MAX_SIDE = 1024
 
 
 def analyze_frame(image_path: str) -> Optional[dict]:
     """Extract visual features from a single keyframe."""
     try:
-        img = Image.open(image_path).convert("RGB")
+        with Image.open(image_path) as source:
+            original_width, original_height = source.size
+            img = source.convert("RGB")
+        if max(img.size) > _FRAME_ANALYSIS_MAX_SIDE:
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            img.thumbnail((_FRAME_ANALYSIS_MAX_SIDE, _FRAME_ANALYSIS_MAX_SIDE), resampling)
     except Exception:
         return None
 
@@ -56,7 +63,7 @@ def analyze_frame(image_path: str) -> Optional[dict]:
     tb_balance = float(top_half - bottom_half)
 
     return {
-        "resolution": f"{w}x{h}",
+        "resolution": f"{original_width}x{original_height}",
         "mean_brightness": round(mean_lum, 3),
         "contrast_std": round(std_lum, 3),
         "shadows_pct": round(shadows_pct, 2),
@@ -87,76 +94,50 @@ def compute_optical_flow(frame1_path: str, frame2_path: str) -> Optional[dict]:
     Returns a dict with motion description, or None if frames can't be loaded.
     """
     try:
-        img1 = cv2.imread(frame1_path, cv2.IMREAD_GRAYSCALE)
-        img2 = cv2.imread(frame2_path, cv2.IMREAD_GRAYSCALE)
-        if img1 is None or img2 is None:
-            return None
+        import cv2
     except Exception:
         return None
 
-    h, w = img1.shape
+    try:
+        with Image.open(frame1_path) as source1:
+            img1 = source1.convert("L")
+        with Image.open(frame2_path) as source2:
+            img2 = source2.convert("L")
+    except Exception:
+        return None
 
-    # Resize to speed up computation
-    scale = min(1.0, 480.0 / max(h, w))
-    if scale < 1.0:
-        img1 = cv2.resize(img1, (int(w * scale), int(h * scale)))
-        img2 = cv2.resize(img2, (int(w * scale), int(h * scale)))
-        h, w = img1.shape
+    try:
+        max_side = 320
+        if max(img1.size) > max_side:
+            img1.thumbnail((max_side, max_side))
+        if max(img2.size) > max_side:
+            img2.thumbnail((max_side, max_side))
+        if img1.size != img2.size:
+            img2 = img2.resize(img1.size)
 
-    flow = cv2.calcOpticalFlowFarneback(img1, img2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        prev = np.array(img1, dtype=np.uint8)
+        nxt = np.array(img2, dtype=np.uint8)
+        flow = cv2.calcOpticalFlowFarneback(prev, nxt, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    except Exception:
+        return None
 
-    mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-    mean_magnitude = float(np.mean(mag))
-    max_magnitude = float(np.max(mag))
-
-    # Direction analysis
-    angles = np.arctan2(flow[..., 1], flow[..., 0])
-    mean_angle = float(np.mean(angles))
-
-    # Check for zoom (vectors radiating from center)
-    cy, cx = h / 2, w / 2
-    ys, xs = np.mgrid[:h, :w]
-    center_dirs_x = (xs - cx).astype(np.float32)
-    center_dirs_y = (ys - cy).astype(np.float32)
-    center_dirs_mag = np.sqrt(center_dirs_x**2 + center_dirs_y**2) + 1e-6
-    center_dirs_x /= center_dirs_mag
-    center_dirs_y /= center_dirs_mag
-
-    # Dot product of flow with radial direction: + = zoom out, - = zoom in
-    dot = flow[..., 0] * center_dirs_x + flow[..., 1] * center_dirs_y
-    zoom_score = float(np.mean(dot))
-
-    # Determine dominant motion
-    if max_magnitude < 0.5:
-        motion = "static"
-        confidence = 1.0 - mean_magnitude
-    elif abs(zoom_score) > 0.3 * mean_magnitude:
-        motion = "zoom_in" if zoom_score < 0 else "zoom_out"
-        confidence = min(1.0, abs(zoom_score) / (mean_magnitude + 0.01))
+    mean_mag = float(np.mean(mag))
+    if mean_mag < 0.25:
+        movement = "static"
     else:
-        # Pan/tilt based on dominant direction
-        dx_mean = float(np.mean(flow[..., 0]))
-        dy_mean = float(np.mean(flow[..., 1]))
-        mag_mean = np.sqrt(dx_mean**2 + dy_mean**2)
-
-        if mag_mean < 0.3:
-            motion = "static"
-        elif abs(dx_mean) > abs(dy_mean) * 1.5:
-            motion = "pan_right" if dx_mean > 0 else "pan_left"
-        elif abs(dy_mean) > abs(dx_mean) * 1.5:
-            motion = "tilt_down" if dy_mean > 0 else "tilt_up"
+        mean_x = float(np.mean(flow[..., 0]))
+        mean_y = float(np.mean(flow[..., 1]))
+        if abs(mean_x) > abs(mean_y):
+            movement = "pan-right" if mean_x > 0 else "pan-left"
         else:
-            direction = "right" if dx_mean > 0 else "left"
-            motion = f"pan_{direction}_with_slight_tilt"
-        confidence = min(1.0, mag_mean / 3.0)
+            movement = "tilt-down" if mean_y > 0 else "tilt-up"
 
     return {
-        "dominant_motion": motion,
-        "mean_magnitude": round(mean_magnitude, 2),
-        "max_magnitude": round(max_magnitude, 2),
-        "direction": round(float(np.degrees(mean_angle)) % 360, 0),
-        "zoom_score": round(zoom_score, 3),
-        "confidence": round(confidence, 2),
+        "motion_magnitude": round(mean_mag, 3),
+        "motion_std": round(float(np.std(mag)), 3),
+        "dominant_angle_deg": round(float(np.degrees(np.mean(ang))), 1),
+        "camera_movement": movement,
     }
 
 

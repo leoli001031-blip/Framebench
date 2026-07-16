@@ -1,7 +1,8 @@
 import asyncio
+import atexit
 import json
+import multiprocessing
 import os
-import subprocess
 import threading
 from collections.abc import Callable
 from typing import Optional
@@ -9,30 +10,209 @@ from PIL import Image
 from backend.config import (
     FFMPEG_BIN, FFPROBE_BIN, JOBS_DIR,
     UI_FRAME_MAX_SIDE, UI_FRAME_JPEG_QUALITY,
-    FRAME_EXTRACTION_CONCURRENCY,
+    FRAME_EXTRACTION_CONCURRENCY, MAX_SHOTS, PREPROCESS_JOB_CONCURRENCY,
 )
-from backend.database import AsyncSessionLocal
+from backend.database import AsyncSessionLocal, get_system_setting
 from backend.models import Job, Shot, TranscriptSegment
+from backend.services.cancellable_process import run_cancellable
 from backend.services.perf import directory_size_bytes, perf_now, record_duration
 
-_whisper_model = None
+_whisper_models: dict[str, object] = {}
 _whisper_lock = threading.Lock()
+_preprocess_semaphore: asyncio.Semaphore | None = None
+_preprocess_semaphore_loop: asyncio.AbstractEventLoop | None = None
 
 
-def _get_whisper_model():
+def _get_preprocess_semaphore() -> asyncio.Semaphore:
+    global _preprocess_semaphore, _preprocess_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _preprocess_semaphore is None or _preprocess_semaphore_loop is not loop:
+        _preprocess_semaphore = asyncio.Semaphore(max(1, PREPROCESS_JOB_CONCURRENCY))
+        _preprocess_semaphore_loop = loop
+    return _preprocess_semaphore
+
+
+def _get_whisper_model(model_name: str = "base"):
     """Lazy-load whisper model with thread-safe double-checked locking."""
-    global _whisper_model
-    if _whisper_model is None:
+    name = (model_name or "base").strip() or "base"
+    if name not in _whisper_models:
         with _whisper_lock:
-            if _whisper_model is None:
+            if name not in _whisper_models:
                 import whisper
-                _whisper_model = whisper.load_model("base")
-    return _whisper_model
+                _whisper_models[name] = whisper.load_model(name)
+    return _whisper_models[name]
+
+
+def _whisper_worker_main(connection) -> None:
+    """Keep the Whisper model outside the API process so transcription can be stopped."""
+    try:
+        while True:
+            try:
+                request = connection.recv()
+            except (EOFError, OSError):
+                return
+            if request is None:
+                return
+
+            audio_file, model_name = request
+            try:
+                model = _get_whisper_model(model_name)
+                result = model.transcribe(audio_file)
+                segments = [
+                    {
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "text": segment["text"].strip(),
+                    }
+                    for segment in result.get("segments", [])
+                ]
+                response = ("ok", segments)
+            except ImportError:
+                response = ("ok", [])
+            except Exception as exc:
+                response = ("error", f"{type(exc).__name__}: {exc}")
+
+            try:
+                connection.send(response)
+            except (BrokenPipeError, EOFError, OSError):
+                return
+    finally:
+        connection.close()
+
+
+class _WhisperWorker:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._process = None
+        self._connection = None
+
+    def transcribe(
+        self,
+        audio_file: str,
+        model_name: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> list[dict]:
+        if cancel_check and cancel_check():
+            raise asyncio.CancelledError()
+
+        with self._lock:
+            self._ensure_started_locked()
+            process = self._process
+            connection = self._connection
+            if process is None or connection is None:
+                raise RuntimeError("Whisper worker failed to start")
+
+            try:
+                connection.send((audio_file, model_name))
+                while True:
+                    if cancel_check and cancel_check():
+                        self._stop_locked()
+                        raise asyncio.CancelledError()
+
+                    if connection.poll(0.1):
+                        status, payload = connection.recv()
+                        if cancel_check and cancel_check():
+                            self._stop_locked()
+                            raise asyncio.CancelledError()
+                        if status == "ok":
+                            return payload
+                        raise RuntimeError(f"Whisper transcription failed: {payload}")
+
+                    if not process.is_alive():
+                        self._stop_locked()
+                        raise RuntimeError("Whisper worker exited unexpectedly")
+            except asyncio.CancelledError:
+                raise
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                self._stop_locked()
+                raise RuntimeError("Whisper worker connection failed") from exc
+
+    def close(self) -> None:
+        with self._lock:
+            self._stop_locked(graceful=True)
+
+    def _ensure_started_locked(self) -> None:
+        if self._process is not None and self._process.is_alive() and self._connection is not None:
+            return
+
+        self._stop_locked()
+        context = multiprocessing.get_context("spawn")
+        parent_connection, child_connection = context.Pipe()
+        process = context.Process(
+            target=_whisper_worker_main,
+            args=(child_connection,),
+            name="framebench-whisper",
+            daemon=True,
+        )
+        try:
+            process.start()
+        except BaseException:
+            parent_connection.close()
+            child_connection.close()
+            raise
+        child_connection.close()
+        self._process = process
+        self._connection = parent_connection
+
+    def _stop_locked(self, graceful: bool = False) -> None:
+        process = self._process
+        connection = self._connection
+        self._process = None
+        self._connection = None
+
+        if process is not None and process.is_alive() and graceful and connection is not None:
+            try:
+                connection.send(None)
+                process.join(timeout=0.5)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+
+        if process is not None and process.is_alive():
+            process.terminate()
+            process.join(timeout=1.0)
+        if process is not None and process.is_alive():
+            process.kill()
+            process.join()
+        if process is not None and not process.is_alive():
+            process.join()
+            process.close()
+        if connection is not None:
+            connection.close()
+
+
+_whisper_worker = _WhisperWorker()
+atexit.register(_whisper_worker.close)
 
 
 class Preprocessor:
     async def run(self, job_id: str, video_path: str, queue: asyncio.Queue,
                   cancel_check: Optional[Callable[[], bool]] = None) -> tuple[list[dict], list[dict], dict]:
+        semaphore = _get_preprocess_semaphore()
+        if semaphore.locked():
+            await queue.put({
+                "event": "status",
+                "data": {
+                    "phase": "preprocessing",
+                    "step": "queued",
+                    "message": "Waiting for local preprocessing capacity...",
+                },
+            })
+        acquired = False
+        try:
+            while not acquired:
+                self._raise_if_cancelled(cancel_check)
+                try:
+                    await asyncio.wait_for(semaphore.acquire(), timeout=0.2)
+                    acquired = True
+                except TimeoutError:
+                    continue
+            return await self._run(job_id, video_path, queue, cancel_check)
+        finally:
+            if acquired:
+                semaphore.release()
+
+    async def _run(self, job_id: str, video_path: str, queue: asyncio.Queue,
+                   cancel_check: Optional[Callable[[], bool]] = None) -> tuple[list[dict], list[dict], dict]:
         job_dir = os.path.join(JOBS_DIR, job_id)
         frames_dir = os.path.join(job_dir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
@@ -43,8 +223,10 @@ class Preprocessor:
             "data": {"phase": "preprocessing", "step": "shot_detection", "message": "Detecting shots..."}
         })
         phase_started = perf_now()
-        shots = await asyncio.to_thread(self._detect_shots, video_path, job_dir)
+        shots = await asyncio.to_thread(self._detect_shots, video_path, job_dir, cancel_check)
         record_duration(job_dir, "shot_detection_sec", phase_started, {"shot_count": len(shots)})
+        if len(shots) > MAX_SHOTS:
+            raise RuntimeError(f"检测到 {len(shots)} 个镜头，超过单次分析上限 {MAX_SHOTS}")
         self._raise_if_cancelled(cancel_check)
         await queue.put({
             "event": "status",
@@ -58,7 +240,7 @@ class Preprocessor:
         })
         from backend.services.audio_analyzer import analyze_audio
         phase_started = perf_now()
-        audio_analysis = await asyncio.to_thread(analyze_audio, video_path, job_dir)
+        audio_analysis = await asyncio.to_thread(analyze_audio, video_path, job_dir, cancel_check)
         record_duration(job_dir, "audio_analysis_sec", phase_started)
         self._raise_if_cancelled(cancel_check)
         self._save_audio_analysis(job_dir, audio_analysis)
@@ -68,7 +250,12 @@ class Preprocessor:
             "data": {"phase": "preprocessing", "step": "playback_video", "message": "Preparing playback video..."}
         })
         phase_started = perf_now()
-        playback_created = await asyncio.to_thread(self._ensure_playback_video, video_path, job_dir)
+        playback_created = await asyncio.to_thread(
+            self._ensure_playback_video,
+            video_path,
+            job_dir,
+            cancel_check,
+        )
         record_duration(job_dir, "playback_video_sec", phase_started, {"playback_video_created": playback_created})
         self._raise_if_cancelled(cancel_check)
 
@@ -81,16 +268,28 @@ class Preprocessor:
         phase_started = perf_now()
         frame_semaphore = asyncio.Semaphore(max(1, FRAME_EXTRACTION_CONCURRENCY))
 
+        frame_stop_event = threading.Event()
+
+        def frame_cancel_check() -> bool:
+            return frame_stop_event.is_set() or bool(cancel_check and cancel_check())
+
         async def process_one_shot(shot: dict):
-            self._raise_if_cancelled(cancel_check)
+            self._raise_if_cancelled(frame_cancel_check)
             sn = shot["shot_number"]
             shot_dir = os.path.join(frames_dir, f"shot_{sn:04d}")
             os.makedirs(shot_dir, exist_ok=True)
 
             async with frame_semaphore:
-                self._raise_if_cancelled(cancel_check)
-                await asyncio.to_thread(self._process_shot, video_path, job_id, shot, shot_dir)
-                self._raise_if_cancelled(cancel_check)
+                self._raise_if_cancelled(frame_cancel_check)
+                await asyncio.to_thread(
+                    self._process_shot,
+                    video_path,
+                    job_id,
+                    shot,
+                    shot_dir,
+                    frame_cancel_check,
+                )
+                self._raise_if_cancelled(frame_cancel_check)
 
         processed = 0
         tasks = [asyncio.create_task(process_one_shot(shot)) for shot in shots]
@@ -105,8 +304,7 @@ class Preprocessor:
                                  "progress": processed / len(shots), "shot": processed, "total": len(shots)}
                     })
         except BaseException:
-            for task in tasks:
-                task.cancel()
+            frame_stop_event.set()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
         frame_bytes = await asyncio.to_thread(directory_size_bytes, frames_dir)
@@ -119,10 +317,12 @@ class Preprocessor:
                 "frame_extraction_concurrency": max(1, FRAME_EXTRACTION_CONCURRENCY),
             },
         )
+        await asyncio.to_thread(self._save_analysis_inputs, job_dir, shots)
 
         # Save shots to DB
         async with AsyncSessionLocal() as db:
             for shot in shots:
+                self._raise_if_cancelled(cancel_check)
                 db_shot = Shot(
                     job_id=job_id,
                     shot_number=shot["shot_number"],
@@ -146,8 +346,9 @@ class Preprocessor:
             "data": {"phase": "preprocessing", "step": "transcription", "message": "Transcribing audio..."}
         })
         phase_started = perf_now()
-        transcript = await self._transcribe(video_path, job_dir, job_id, queue)
+        transcript = await self._transcribe(video_path, job_dir, job_id, queue, cancel_check)
         record_duration(job_dir, "transcription_sec", phase_started, {"transcript_segments": len(transcript)})
+        self._raise_if_cancelled(cancel_check)
 
         return shots, transcript, audio_analysis
 
@@ -155,16 +356,22 @@ class Preprocessor:
         if cancel_check and cancel_check():
             raise asyncio.CancelledError()
 
-    def _detect_shots(self, video_path: str, job_dir: str) -> list[dict]:
+    def _detect_shots(
+        self,
+        video_path: str,
+        job_dir: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> list[dict]:
         shots_file = os.path.join(job_dir, "shots.json")
 
-        result = subprocess.run(
+        result = run_cancellable(
             [
                 FFMPEG_BIN, "-i", video_path,
                 "-filter:v", "select='gt(scene,0.13)',showinfo",
                 "-vsync", "vfr", "-f", "null", "-"
             ],
-            capture_output=True, text=True, timeout=120,
+            timeout=120,
+            cancel_check=cancel_check,
         )
         if result.returncode != 0:
             raise RuntimeError(f"Shot detection failed: {result.stderr}")
@@ -181,7 +388,7 @@ class Preprocessor:
                 except (ValueError, IndexError):
                     continue
 
-        duration = self._get_duration(video_path)
+        duration = self._get_duration(video_path, cancel_check)
         if changes[-1] < duration:
             changes.append(duration)
 
@@ -206,8 +413,31 @@ class Preprocessor:
         with open(path, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-    def _ensure_playback_video(self, video_path: str, job_dir: str) -> bool:
-        if self._get_video_codec(video_path) == "h264":
+    def _save_analysis_inputs(self, job_dir: str, shots: list[dict]):
+        path = os.path.join(job_dir, "analysis_inputs.json")
+        temp_path = f"{path}.tmp"
+        keys = (
+            "shot_number",
+            "start_time_sec",
+            "end_time_sec",
+            "duration_sec",
+            "keyframe_paths",
+            "frame_features",
+            "frame_features_by_frame",
+            "optical_flow",
+        )
+        data = [{key: shot[key] for key in keys if key in shot} for shot in shots]
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(temp_path, path)
+
+    def _ensure_playback_video(
+        self,
+        video_path: str,
+        job_dir: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        if self._get_video_codec(video_path, cancel_check) == "h264":
             return False
 
         playback_path = os.path.join(job_dir, "playback.mp4")
@@ -215,54 +445,74 @@ class Preprocessor:
             return True
 
         tmp_path = os.path.join(job_dir, "playback.tmp.mp4")
-        result = subprocess.run(
-            [
-                FFMPEG_BIN, "-y", "-i", video_path,
-                "-map", "0:v:0", "-map", "0:a:0?",
-                "-vf", "scale='min(1280,iw)':-2",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                tmp_path,
-            ],
-            capture_output=True, text=True, timeout=1800,
-        )
+        try:
+            result = run_cancellable(
+                [
+                    FFMPEG_BIN, "-y", "-i", video_path,
+                    "-map", "0:v:0", "-map", "0:a:0?",
+                    "-vf", "scale='min(1280,iw)':-2",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    tmp_path,
+                ],
+                timeout=1800,
+                cancel_check=cancel_check,
+            )
+        except BaseException:
+            self._remove_file(tmp_path)
+            raise
         if result.returncode != 0:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+            self._remove_file(tmp_path)
             return False
 
+        self._raise_if_cancelled(cancel_check)
         os.replace(tmp_path, playback_path)
         return True
 
-    def _get_video_codec(self, video_path: str) -> str:
-        result = subprocess.run(
+    def _get_video_codec(
+        self,
+        video_path: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> str:
+        result = run_cancellable(
             [
                 FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "stream=codec_name",
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 video_path,
             ],
-            capture_output=True, text=True, timeout=30,
+            timeout=30,
+            cancel_check=cancel_check,
         )
         if result.returncode != 0:
             return ""
         return result.stdout.strip().lower()
 
-    def _extract_frame(self, video_path: str, output_path: str, time_sec: float):
-        result = subprocess.run(
-            [
-                FFMPEG_BIN, "-y", "-ss", str(time_sec),
-                "-i", video_path,
-                "-vframes", "1", "-q:v", "2",
-                output_path
-            ],
-            capture_output=True, text=True, timeout=60,
-        )
+    def _extract_frame(
+        self,
+        video_path: str,
+        output_path: str,
+        time_sec: float,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ):
+        try:
+            result = run_cancellable(
+                [
+                    FFMPEG_BIN, "-y", "-ss", str(time_sec),
+                    "-i", video_path,
+                    "-vframes", "1", "-q:v", "2",
+                    output_path
+                ],
+                timeout=60,
+                cancel_check=cancel_check,
+            )
+        except BaseException:
+            self._remove_file(output_path)
+            raise
         if result.returncode != 0:
+            self._remove_file(output_path)
             raise RuntimeError(f"Frame extraction failed: {result.stderr}")
 
     def _create_ui_thumbnail(self, source_path: str, output_path: str) -> str:
@@ -276,7 +526,14 @@ class Preprocessor:
         except Exception:
             return source_path
 
-    def _process_shot(self, video_path: str, job_id: str, shot: dict, shot_dir: str):
+    def _process_shot(
+        self,
+        video_path: str,
+        job_id: str,
+        shot: dict,
+        shot_dir: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ):
         """Run all blocking per-shot work: frame extraction, analysis, optical flow."""
         from backend.services.frame_analyzer import analyze_frame, compute_optical_flow
 
@@ -293,25 +550,34 @@ class Preprocessor:
         mid_thumb = os.path.join(shot_dir, "frame_mid_thumb.jpg")
         end_thumb = os.path.join(shot_dir, "frame_end_thumb.jpg")
 
-        self._extract_frame(video_path, start_frame, start_sec)
-        self._extract_frame(video_path, mid_frame, mid_sec)
+        self._extract_frame(video_path, start_frame, start_sec, cancel_check)
+        self._extract_frame(video_path, mid_frame, mid_sec, cancel_check)
         end_time = max(start_sec + 0.1, end_sec - 0.15)
-        self._extract_frame(video_path, end_frame, end_time)
+        self._extract_frame(video_path, end_frame, end_time, cancel_check)
+        self._raise_if_cancelled(cancel_check)
         start_preview = self._create_ui_thumbnail(start_frame, start_thumb)
         mid_preview = self._create_ui_thumbnail(mid_frame, mid_thumb)
         end_preview = self._create_ui_thumbnail(end_frame, end_thumb)
+        self._raise_if_cancelled(cancel_check)
 
-        frame_features = analyze_frame(start_frame)
-        shot["frame_features"] = frame_features
+        frame_features_by_frame = {
+            "start": analyze_frame(start_frame),
+            "mid": analyze_frame(mid_frame),
+            "end": analyze_frame(end_frame),
+        }
+        shot["frame_features_by_frame"] = frame_features_by_frame
+        shot["frame_features"] = frame_features_by_frame["start"]
         shot["duration_sec"] = dur
+        self._raise_if_cancelled(cancel_check)
 
         flow_sm = compute_optical_flow(start_frame, mid_frame)
         flow_me = compute_optical_flow(mid_frame, end_frame)
+        self._raise_if_cancelled(cancel_check)
 
         if flow_sm and flow_me:
             shot["optical_flow"] = {
-                "前半段": f"{flow_sm['dominant_motion']} (幅度{flow_sm['mean_magnitude']}px)",
-                "后半段": f"{flow_me['dominant_motion']} (幅度{flow_me['mean_magnitude']}px)",
+                "前半段": f"{flow_sm['camera_movement']} (幅度{flow_sm['motion_magnitude']}px)",
+                "后半段": f"{flow_me['camera_movement']} (幅度{flow_me['motion_magnitude']}px)",
             }
         else:
             shot["optical_flow"] = {"前半段": "无法计算", "后半段": "无法计算"}
@@ -323,44 +589,64 @@ class Preprocessor:
             keyframes.append(f"{job_id}/frames/shot_{sn:04d}/{os.path.basename(end_preview)}")
         shot["keyframe_paths"] = json.dumps(keyframes)
 
-    def _run_transcription(self, video_path: str, audio_file: str) -> list[dict]:
+    def _run_transcription(
+        self,
+        video_path: str,
+        audio_file: str,
+        whisper_model_name: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> list[dict]:
         """Run ffmpeg audio extraction + whisper transcription (blocking)."""
         if not os.path.exists(audio_file) or os.path.getsize(audio_file) < 1000:
-            result = subprocess.run(
-                [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
-                 "-ar", "16000", "-ac", "1", audio_file],
-                capture_output=True, text=True, timeout=120,
-            )
+            from backend.services.audio_analyzer import has_audio_stream
+            if not has_audio_stream(video_path, cancel_check):
+                self._remove_file(audio_file)
+                return []
+            try:
+                result = run_cancellable(
+                    [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+                     "-ar", "16000", "-ac", "1", audio_file],
+                    timeout=120,
+                    cancel_check=cancel_check,
+                )
+            except BaseException:
+                self._remove_file(audio_file)
+                raise
             if result.returncode != 0:
+                self._remove_file(audio_file)
                 raise RuntimeError(f"Audio extraction failed: {result.stderr}")
 
-        segments = []
-        try:
-            model = _get_whisper_model()
-            result = model.transcribe(audio_file)
+        return _whisper_worker.transcribe(audio_file, whisper_model_name, cancel_check)
 
-            for seg in result.get("segments", []):
-                segments.append({
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "text": seg["text"].strip(),
-                })
-        except ImportError:
-            pass
-
-        return segments
-
-    async def _transcribe(self, video_path: str, job_dir: str, job_id: str, queue: asyncio.Queue) -> list[dict]:
+    async def _transcribe(
+        self,
+        video_path: str,
+        job_dir: str,
+        job_id: str,
+        queue: asyncio.Queue,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> list[dict]:
         transcript_file = os.path.join(job_dir, "transcript.json")
         audio_file = os.path.join(job_dir, "audio.wav")
 
-        segments = await asyncio.to_thread(self._run_transcription, video_path, audio_file)
+        self._raise_if_cancelled(cancel_check)
+        whisper_model_name = await get_system_setting("whisper_model", "base")
+        self._raise_if_cancelled(cancel_check)
+        segments = await asyncio.to_thread(
+            self._run_transcription,
+            video_path,
+            audio_file,
+            whisper_model_name,
+            cancel_check,
+        )
+        self._raise_if_cancelled(cancel_check)
 
         with open(transcript_file, "w") as f:
             json.dump(segments, f, indent=2)
 
         async with AsyncSessionLocal() as db:
             for seg in segments:
+                self._raise_if_cancelled(cancel_check)
                 db_seg = TranscriptSegment(
                     job_id=job_id,
                     start_sec=seg["start"],
@@ -378,11 +664,16 @@ class Preprocessor:
 
         return segments
 
-    def _get_duration(self, video_path: str) -> float:
-        result = subprocess.run(
+    def _get_duration(
+        self,
+        video_path: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> float:
+        result = run_cancellable(
             [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True, timeout=30,
+            timeout=30,
+            cancel_check=cancel_check,
         )
         if result.returncode != 0:
             raise RuntimeError(f"ffprobe failed: {result.stderr}")
@@ -390,3 +681,10 @@ class Preprocessor:
             return float(result.stdout.strip())
         except ValueError:
             return 0.0
+
+    @staticmethod
+    def _remove_file(path: str) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass

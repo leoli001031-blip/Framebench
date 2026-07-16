@@ -8,6 +8,7 @@ export function useSSE(jobId: string | null, handlers: {
   onThinking?: (data: Record<string, unknown>) => void
   onComplete?: (data: Record<string, unknown>) => void
   onError?: (data: Record<string, unknown>) => void
+  onOverviewFailed?: (data: Record<string, unknown>) => void
   onDone?: (status?: string) => void
 }) {
   const handlersRef = useRef(handlers)
@@ -39,6 +40,9 @@ export function useSSE(jobId: string | null, handlers: {
     })
     evtSource.addEventListener("job_error", (e) => {
       try { handlersRef.current.onError?.(JSON.parse(e.data)) } catch { /* skip malformed events */ }
+    })
+    evtSource.addEventListener("overview_failed", (e) => {
+      try { handlersRef.current.onOverviewFailed?.(JSON.parse(e.data)) } catch { /* skip malformed events */ }
     })
     evtSource.addEventListener("shot_error", (e) => {
       try { handlersRef.current.onError?.(JSON.parse(e.data)) } catch { /* skip malformed events */ }

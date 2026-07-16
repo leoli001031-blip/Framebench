@@ -1,12 +1,41 @@
 """Audio analysis for BGM, energy, and spectral features."""
-import subprocess
+import asyncio
 import os
+from collections.abc import Callable
+from typing import Optional
 import numpy as np
 import librosa
-from backend.config import FFMPEG_BIN
+from backend.config import FFMPEG_BIN, FFPROBE_BIN
+from backend.services.cancellable_process import run_cancellable
 
 
-def analyze_audio(video_path: str, job_dir: str) -> dict:
+def has_audio_stream(
+    video_path: str,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Return whether the media contains a usable primary audio stream."""
+    result = run_cancellable(
+        [
+            FFPROBE_BIN,
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            video_path,
+        ],
+        timeout=30,
+        cancel_check=cancel_check,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Audio probe failed: {result.stderr}")
+    return bool(result.stdout.strip())
+
+
+def analyze_audio(
+    video_path: str,
+    job_dir: str,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> dict:
     """Extract audio features from video for BGM-aware analysis.
 
     Returns a dict with BPM, energy curve, spectral features, and segment description.
@@ -14,39 +43,55 @@ def analyze_audio(video_path: str, job_dir: str) -> dict:
     audio_path = os.path.join(job_dir, "audio.wav")
 
     # Extract audio if not already done
-    if not os.path.exists(audio_path):
-        result = subprocess.run(
-            [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
-             "-ar", "16000", "-ac", "1", audio_path],
-            capture_output=True, text=True, timeout=120,
-        )
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1000:
+        if not has_audio_stream(video_path, cancel_check):
+            _remove_file(audio_path)
+            return {"error": "no audio"}
+        try:
+            result = run_cancellable(
+                [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+                 "-ar", "16000", "-ac", "1", audio_path],
+                timeout=120,
+                cancel_check=cancel_check,
+            )
+        except BaseException:
+            _remove_file(audio_path)
+            raise
         if result.returncode != 0:
+            _remove_file(audio_path)
             raise RuntimeError(f"Audio extraction failed: {result.stderr}")
 
     if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1000:
         return {"error": "no audio"}
 
+    _raise_if_cancelled(cancel_check)
     try:
-        y, sr = librosa.load(audio_path, sr=22050)
+        y, sr = librosa.load(audio_path, sr=None)
         duration = len(y) / sr
     except Exception:
         return {"error": "audio load failed"}
+    _raise_if_cancelled(cancel_check)
 
     if duration < 0.5:
         return {"error": "audio too short"}
 
     # --- BPM ---
     try:
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
         bpm = round(float(tempo))
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        beat_count = len(beat_times)
     except Exception:
         bpm = 0
+        beat_times = np.array([])
+        beat_count = 0
+    _raise_if_cancelled(cancel_check)
 
     # --- Energy curve ---
     hop = 512
     rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
-    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
     rms_norm = rms / (rms.max() + 1e-6)
+    _raise_if_cancelled(cancel_check)
 
     # Segment energy into 4 phases
     n = len(rms_norm)
@@ -78,15 +123,7 @@ def analyze_audio(video_path: str, job_dir: str) -> dict:
     except Exception:
         mean_centroid = 0
         brightness = "未知"
-
-    # --- Beat events ---
-    try:
-        _, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-        beat_count = len(beat_times)
-    except Exception:
-        beat_times = np.array([])
-        beat_count = 0
+    _raise_if_cancelled(cancel_check)
 
     # --- Segment description ---
     segments = []
@@ -114,3 +151,15 @@ def analyze_audio(video_path: str, job_dir: str) -> dict:
         "segments": segments,
         "quarter_energies": [round(q, 3) for q in quarters],
     }
+
+
+def _raise_if_cancelled(cancel_check: Optional[Callable[[], bool]]) -> None:
+    if cancel_check and cancel_check():
+        raise asyncio.CancelledError()
+
+
+def _remove_file(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass

@@ -7,6 +7,10 @@ export default function Layout() {
   const navigate = useNavigate()
 
   useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" })
+  }, [location.pathname])
+
+  useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || location.pathname === "/") return
       const tag = (e.target as HTMLElement)?.tagName
@@ -24,31 +28,31 @@ export default function Layout() {
           <Link to="/" className="text-primary hover:opacity-80 transition-opacity">
             <Logo className="w-24 h-10" />
           </Link>
-          <nav className="flex gap-8 text-[11px] font-medium tracking-widest uppercase">
+          <nav className="flex gap-8 text-xs font-medium tracking-normal uppercase">
             <Link
               to="/"
-              className={location.pathname === "/" ? "text-ink" : "text-muted/40 hover:text-ink transition-colors"}
+              className={location.pathname === "/" ? "text-ink" : "text-muted hover:text-ink transition-colors"}
               aria-current={location.pathname === "/" ? "page" : undefined}
             >
               分析
             </Link>
             <Link
               to="/library"
-              className={location.pathname.startsWith("/library") ? "text-ink" : "text-muted/40 hover:text-ink transition-colors"}
+              className={location.pathname.startsWith("/library") ? "text-ink" : "text-muted hover:text-ink transition-colors"}
               aria-current={location.pathname.startsWith("/library") ? "page" : undefined}
             >
               仓库
             </Link>
             <Link
               to="/storyboard"
-              className={location.pathname === "/storyboard" ? "text-ink" : "text-muted/40 hover:text-ink transition-colors"}
+              className={location.pathname === "/storyboard" ? "text-ink" : "text-muted hover:text-ink transition-colors"}
               aria-current={location.pathname === "/storyboard" ? "page" : undefined}
             >
               分镜
             </Link>
             <Link
               to="/settings"
-              className={location.pathname === "/settings" ? "text-ink" : "text-muted/40 hover:text-ink transition-colors"}
+              className={location.pathname === "/settings" ? "text-ink" : "text-muted hover:text-ink transition-colors"}
               aria-current={location.pathname === "/settings" ? "page" : undefined}
             >
               设置
@@ -56,12 +60,12 @@ export default function Layout() {
           </nav>
         </div>
       </header>
-      <main className="px-8 py-12 max-w-6xl mx-auto w-full flex-1">
+      <main className="px-8 py-8 max-w-6xl mx-auto w-full flex-1">
         <Outlet />
       </main>
       <footer className="px-8 py-16 text-center">
         <Logo className="w-16 h-8 mx-auto opacity-30 grayscale" />
-        <p className="text-[10px] text-muted/20 uppercase tracking-[0.2em] mt-4">Framebench / 拉片工作台</p>
+        <p className="text-xs text-muted uppercase tracking-normal mt-4">Framebench / 拉片工作台</p>
       </footer>
     </div>
   )

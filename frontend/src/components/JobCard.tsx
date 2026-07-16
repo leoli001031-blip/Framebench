@@ -26,11 +26,11 @@ export default function JobCard({
       <div className="flex items-start justify-between gap-6 mb-4">
         <div className="min-w-0">
           <div className="flex items-center gap-3 mb-2">
-            <h3 className="text-xl font-serif font-medium text-ink truncate tracking-tight">{title}</h3>
+            <h3 className="text-xl font-serif font-medium text-ink truncate tracking-normal">{title}</h3>
             <StatusBean type={status} label={statusLabel} />
           </div>
           {conclusion && (
-            <p className="text-sm text-muted/80 leading-relaxed font-medium">{conclusion}</p>
+            <p className="text-sm text-muted leading-relaxed font-medium">{conclusion}</p>
           )}
         </div>
         {primaryAction && (

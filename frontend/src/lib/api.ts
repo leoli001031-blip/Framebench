@@ -1,10 +1,10 @@
-import type { JobInfo, JobDetail, JobSummary, JobShotsPage, JobProgress, CategoryList, StoryboardResult, StoryboardHistoryItem, StoryboardDetail, StoryboardGenerationTask, SystemSettingResponse } from "@/types"
+import type { JobInfo, JobDetail, JobSummary, JobShotsPage, JobProgress, TokenUsageSummary, CategoryList, StoryboardResult, StoryboardHistoryItem, StoryboardDetail, StoryboardGenerationTask, SystemSettingResponse, DataDiagnostics, ArchiveOrphanResponse, StoryboardShot, ConnectivityResponse, ConnectivityTestPayload, ReferenceBoardItem, ReferenceBoardPage } from "@/types"
 import { getApiBase, withAuthHeaders, withAuthQuery } from "@/lib/runtime"
 
 const BASE = getApiBase()
 
 async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(withAuthQuery(`${BASE}${path}`), {
+  return fetch(`${BASE}${path}`, {
     ...init,
     headers: withAuthHeaders(init.headers),
   })
@@ -13,7 +13,21 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<Response>
 async function getErrorDetail(res: Response): Promise<string> {
   try {
     const ct = res.headers.get("content-type") || ""
-    if (ct.includes("application/json")) return (await res.json()).detail || ""
+    if (ct.includes("application/json")) {
+      const detail = (await res.json()).detail
+      if (typeof detail === "string") return detail
+      if (Array.isArray(detail)) {
+        return detail
+          .map((item) => {
+            if (!item || typeof item !== "object") return String(item)
+            const path = Array.isArray(item.loc) ? item.loc.slice(1).join(".") : ""
+            const message = typeof item.msg === "string" ? item.msg : JSON.stringify(item)
+            return path ? `${path}: ${message}` : message
+          })
+          .join("; ")
+      }
+      if (detail && typeof detail === "object") return JSON.stringify(detail)
+    }
   } catch { /* non-JSON body, ignore */ }
   return ""
 }
@@ -32,6 +46,12 @@ export async function startJob(jobId: string): Promise<{ job_id: string; status:
   return res.json()
 }
 
+export async function cancelJob(jobId: string): Promise<{ job_id: string; status: string }> {
+  const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Cancel failed")
+  return res.json()
+}
+
 function toQuery(params: Record<string, string | number | boolean | undefined>): string {
   const query = new URLSearchParams()
   Object.entries(params).forEach(([key, value]) => {
@@ -41,8 +61,13 @@ function toQuery(params: Record<string, string | number | boolean | undefined>):
   return text ? `?${text}` : ""
 }
 
-export async function listJobs(options: { limit?: number; offset?: number } = {}): Promise<JobInfo[]> {
-  const res = await apiFetch(`/jobs${toQuery(options)}`)
+export async function listJobs(options: { limit?: number; offset?: number; includeDeleted?: boolean; onlyDeleted?: boolean } = {}): Promise<JobInfo[]> {
+  const res = await apiFetch(`/jobs${toQuery({
+    limit: options.limit,
+    offset: options.offset,
+    include_deleted: options.includeDeleted,
+    only_deleted: options.onlyDeleted,
+  })}`)
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "List jobs failed")
   return res.json()
 }
@@ -63,6 +88,33 @@ export async function getJobShots(jobId: string, options: { limit?: number; offs
   const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}/shots${toQuery(options)}`)
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "Get job shots failed")
   return res.json()
+}
+
+export async function getJobTokenUsage(jobId: string): Promise<TokenUsageSummary> {
+  const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}/token-usage`)
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Get token usage failed")
+  return res.json()
+}
+
+export async function listReferenceBoard(options: { jobId?: string; limit?: number; offset?: number } = {}): Promise<ReferenceBoardPage> {
+  const res = await apiFetch(`/reference-board${toQuery({
+    job_id: options.jobId,
+    limit: options.limit,
+    offset: options.offset,
+  })}`)
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Reference board failed")
+  return res.json()
+}
+
+export async function addReferenceBoardShot(shotId: number): Promise<ReferenceBoardItem> {
+  const res = await apiFetch(`/reference-board/shots/${shotId}`, { method: "PUT" })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Add reference shot failed")
+  return res.json()
+}
+
+export async function removeReferenceBoardShot(shotId: number): Promise<void> {
+  const res = await apiFetch(`/reference-board/shots/${shotId}`, { method: "DELETE" })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Remove reference shot failed")
 }
 
 export async function getJobProgress(
@@ -88,9 +140,30 @@ export async function updateJob(jobId: string, data: { category?: string; filena
   return res.json()
 }
 
+export async function renameCategory(oldName: string, newName: string): Promise<{ updated: number }> {
+  const res = await apiFetch("/categories/rename", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ old_name: oldName, new_name: newName }),
+  })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Rename category failed")
+  return res.json()
+}
+
 export async function deleteJob(jobId: string): Promise<void> {
   const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" })
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "Delete job failed")
+}
+
+export async function restoreJob(jobId: string): Promise<JobInfo> {
+  const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}/restore`, { method: "POST" })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Restore job failed")
+  return res.json()
+}
+
+export async function permanentlyDeleteJob(jobId: string): Promise<void> {
+  const res = await apiFetch(`/jobs/${encodeURIComponent(jobId)}/permanent`, { method: "DELETE" })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Permanent delete failed")
 }
 
 export async function listCategories(): Promise<CategoryList> {
@@ -99,11 +172,22 @@ export async function listCategories(): Promise<CategoryList> {
   return res.json()
 }
 
-export async function generateStoryboard(brief: string, referenceJobIds: string[], targetDurationSec?: number): Promise<StoryboardResult> {
+export async function generateStoryboard(
+  brief: string,
+  referenceJobIds: string[],
+  targetDurationSec?: number,
+  options: { referenceShotIds?: number[]; generateImages?: boolean } = {},
+): Promise<StoryboardResult> {
   const res = await apiFetch("/generate-storyboard", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ brief, reference_job_ids: referenceJobIds, target_duration_sec: targetDurationSec }),
+    body: JSON.stringify({
+      brief,
+      reference_job_ids: referenceJobIds,
+      reference_shot_ids: options.referenceShotIds || [],
+      target_duration_sec: targetDurationSec,
+      generate_images: options.generateImages ?? true,
+    }),
   })
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "Generate failed")
   return res.json()
@@ -123,18 +207,28 @@ export async function generateStoryboardStream(
   callbacks: StoryboardStreamCallbacks,
   signal?: AbortSignal,
   clientTaskId?: string,
+  options: { referenceShotIds?: number[]; generateImages?: boolean } = {},
 ): Promise<void> {
-  const res = await apiFetch("/generate-storyboard", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      brief,
-      reference_job_ids: referenceJobIds,
-      target_duration_sec: targetDurationSec,
-      client_task_id: clientTaskId,
-    }),
-    signal,
-  })
+  let res: Response
+  try {
+    res = await apiFetch("/generate-storyboard", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        brief,
+        reference_job_ids: referenceJobIds,
+        reference_shot_ids: options.referenceShotIds || [],
+        target_duration_sec: targetDurationSec,
+        generate_images: options.generateImages ?? true,
+        client_task_id: clientTaskId,
+      }),
+      signal,
+    })
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") return
+    callbacks.onError(e instanceof Error ? e.message : "连接中断")
+    return
+  }
 
   if (!res.ok) {
     callbacks.onError((await getErrorDetail(res)) || "Generate failed")
@@ -240,6 +334,12 @@ export async function getStoryboard(id: string): Promise<StoryboardDetail> {
   return res.json()
 }
 
+export async function retryStoryboardShotImage(storyboardId: string, shotNumber: number): Promise<StoryboardShot> {
+  const res = await apiFetch(`/storyboards/${storyboardId}/shots/${shotNumber}/image`, { method: "POST" })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Retry image failed")
+  return res.json()
+}
+
 export async function deleteStoryboard(id: string): Promise<void> {
   const res = await apiFetch(`/storyboards/${id}`, { method: "DELETE" })
   if (!res.ok) throw new Error((await getErrorDetail(res)) || "Delete storyboard failed")
@@ -257,15 +357,44 @@ export async function updateSetting(key: string, value: string): Promise<SystemS
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ value }),
   })
-  if (!res.ok) throw new Error("Update setting failed")
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Update setting failed")
   return res.json()
 }
 
-export async function testConnectivity(): Promise<{ status: string; message: string }> {
+export async function testConnectivity(payload: ConnectivityTestPayload): Promise<ConnectivityResponse> {
   const res = await apiFetch("/settings/test-connectivity", {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data.detail || "Connectivity test failed")
-  return data
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Connectivity test failed")
+  return res.json()
+}
+
+export async function testImageConnectivity(payload: ConnectivityTestPayload): Promise<ConnectivityResponse> {
+  const res = await apiFetch("/settings/test-image-connectivity", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Image connectivity test failed")
+  return res.json()
+}
+
+export async function getDataDiagnostics(): Promise<DataDiagnostics> {
+  const res = await apiFetch("/data-diagnostics")
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Data diagnostics failed")
+  return res.json()
+}
+
+export async function archiveOrphanJobDir(id: string): Promise<ArchiveOrphanResponse> {
+  const res = await apiFetch(`/data-diagnostics/orphans/${encodeURIComponent(id)}/archive`, { method: "POST" })
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Archive orphan job dir failed")
+  return res.json()
+}
+
+export async function getBackendLog(): Promise<string> {
+  const res = await apiFetch("/diagnostics/logs/backend")
+  if (!res.ok) throw new Error((await getErrorDetail(res)) || "Get backend log failed")
+  return res.text()
 }

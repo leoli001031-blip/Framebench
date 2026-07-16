@@ -7,6 +7,8 @@ film_master.db
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
 data/
 data/jobs/
 frontend/dist/
@@ -22,3 +24,4 @@ shot_analysis*.json
 
 # Local browser/test output
 .playwright-mcp/
+.workbuddy/

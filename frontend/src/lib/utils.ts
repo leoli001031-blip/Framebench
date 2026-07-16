@@ -23,6 +23,45 @@ export function getFrameUrl(keyframePaths: string): string | null {
   }
 }
 
+export function getStoryboardImageUrl(imageUrl?: string | null, imagePath?: string | null): string | null {
+  const raw = (imageUrl || imagePath || "").trim()
+  if (!raw) return null
+  if (/^(data|blob):/i.test(raw)) return raw
+  if (/^https?:\/\//i.test(raw)) return shouldAttachAuth(raw) ? withAuthQuery(raw) : raw
+
+  const path = raw.replace(/\\/g, "/")
+  if (path.startsWith("/api/frames/")) {
+    return withAuthQuery(`${API_BASE}/frames/${path.slice("/api/frames/".length)}`)
+  }
+  if (path.startsWith("api/frames/")) {
+    return withAuthQuery(`${API_BASE}/frames/${path.slice("api/frames/".length)}`)
+  }
+  if (path.startsWith("/frames/")) {
+    return withAuthQuery(`${API_BASE}${path}`)
+  }
+  if (path.includes("data/jobs/")) {
+    const p = path.replace(/^.*?data\/jobs\//, "").replace(/^\/+/, "")
+    return p ? withAuthQuery(`${API_BASE}/frames/${p}`) : null
+  }
+
+  return withAuthQuery(`${API_BASE}/frames/${path.replace(/^\/+/, "")}`)
+}
+
+function shouldAttachAuth(url: string): boolean {
+  try {
+    const parsed = new URL(url, window.location.href)
+    const api = new URL(API_BASE, window.location.href)
+    const apiPath = api.pathname.replace(/\/$/, "")
+    return parsed.origin === api.origin && (
+      parsed.pathname === apiPath ||
+      parsed.pathname.startsWith(`${apiPath}/`) ||
+      parsed.pathname.startsWith("/api/frames/")
+    )
+  } catch {
+    return false
+  }
+}
+
 export function getShotVideoUrl(jobId: string, startSec: number, endSec: number): string {
   const baseUrl = withAuthQuery(`${API_BASE}/jobs/${encodeURIComponent(jobId)}/video`)
   const start = Math.max(0, startSec).toFixed(2)
