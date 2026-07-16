@@ -29,6 +29,7 @@ class Job(Base):
     overview_text = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
+    deleted_at = Column(DateTime, nullable=True)
 
     shots = relationship("Shot", back_populates="job", cascade="all, delete-orphan")
     transcript_segments = relationship("TranscriptSegment", back_populates="job", cascade="all, delete-orphan")
@@ -52,6 +53,15 @@ class Shot(Base):
 
     job = relationship("Job", back_populates="shots")
     dimensions = relationship("Dimension", back_populates="shot", cascade="all, delete-orphan")
+
+
+class ReferenceBoardItem(Base):
+    __tablename__ = "reference_board_items"
+
+    shot_id = Column(Integer, ForeignKey("shots.id", ondelete="CASCADE"), primary_key=True)
+    created_at = Column(DateTime, default=_now)
+
+    shot = relationship("Shot")
 
 
 class Dimension(Base):
@@ -90,6 +100,7 @@ class Storyboard(Base):
     full_notes = Column(Text, nullable=True)
     total_duration_sec = Column(Float, nullable=True)
     reference_job_ids = Column(Text, nullable=False)  # JSON array
+    reference_shot_ids = Column(Text, nullable=False, default="[]")  # JSON array
     created_at = Column(DateTime, default=_now)
 
     shots = relationship("StoryboardShot", back_populates="storyboard", cascade="all, delete-orphan")
@@ -107,6 +118,10 @@ class StoryboardShot(Base):
     bgm_note = Column(Text, nullable=True)
     reference_from = Column(String, nullable=True)
     image_prompt = Column(Text, nullable=True)
+    image_url = Column(Text, nullable=True)
+    image_status = Column(String, nullable=True)
+    image_error = Column(Text, nullable=True)
+    image_updated_at = Column(DateTime, nullable=True)
 
     storyboard = relationship("Storyboard", back_populates="shots")
 
@@ -117,6 +132,7 @@ class StoryboardGenerationTask(Base):
     id = Column(String, primary_key=True, default=gen_uuid)
     brief = Column(Text, nullable=False)
     reference_job_ids = Column(Text, nullable=False)
+    reference_shot_ids = Column(Text, nullable=False, default="[]")
     target_duration_sec = Column(Integer, nullable=True)
     status = Column(String, nullable=False, default="queued")
     progress = Column(Float, default=0.0)

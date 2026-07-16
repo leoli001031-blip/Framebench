@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from "react"
 import { useParams, useNavigate } from "react-router-dom"
-import { getJobProgress, startJob } from "@/lib/api"
+import { cancelJob, getJobProgress, startJob } from "@/lib/api"
 import { mapJobStatus } from "@/lib/constants"
 import { useSSE } from "@/hooks/useSSE"
 import type { JobProgress } from "@/types"
@@ -21,6 +21,7 @@ export default function ProgressPage() {
   const [error, setError] = useState("")
   const [elapsedSec, setElapsedSec] = useState(0)
   const [loadingMoreShots, setLoadingMoreShots] = useState(false)
+  const [cancelSubmitting, setCancelSubmitting] = useState(false)
   const startedRef = useRef(false)
   const runningSinceRef = useRef<number | null>(null)
   const pendingThinkingRef = useRef("")
@@ -68,15 +69,22 @@ export default function ProgressPage() {
   }, [jobId])
 
   useEffect(() => {
-    if (job && (job.status === "pending" || job.status === "preprocessing_done")) {
+    if (job?.status === "pending") {
       if (!jobId || startedRef.current) return
       startedRef.current = true
-      startJob(jobId).catch((e) => setError(e instanceof Error ? e.message : "启动失败"))
+      startJob(jobId)
+        .then((started) => {
+          setJob((prev) => prev ? { ...prev, status: started.status } : prev)
+        })
+        .catch((e) => {
+          startedRef.current = false
+          setError(e instanceof Error ? e.message : "启动失败")
+        })
     }
   }, [job, jobId])
 
   useEffect(() => {
-    const running = job?.status === "preprocessing" || job?.status === "preprocessing_done" || job?.status === "analyzing"
+    const running = job?.status === "preprocessing" || job?.status === "preprocessing_done" || job?.status === "analyzing" || job?.status === "cancelling"
     if (!running) return
 
     if (runningSinceRef.current == null) {
@@ -113,37 +121,73 @@ export default function ProgressPage() {
     }
   }
 
-  useSSE(job?.status === "preprocessing" || job?.status === "analyzing" ? (jobId ?? null) : null, {
-    onStatus: (data) => {
-      setPreprocessMsg(data.message as string)
-      setPreprocessStep(data.step as string)
-      if (data.message === "Analyzing..." || data.phase === "analyzing") {
-        setJob((prev) => prev ? { ...prev, status: "analyzing" } : null)
-      }
-    },
-    onShotStart: () => {},
-    onShotDone: (data) => {
-      const sn = data.shot_number as number
-      if (typeof sn !== "number" || !Number.isFinite(sn) || sn < 1) return
-      setCompletedShots((prev) => new Set(prev).add(sn))
-    },
-    onThinking: (data) => { queueThinkingUpdate(data.text as string) },
-    onComplete: () => { setJob((prev) => prev ? { ...prev, status: "completed" } : null) },
-    onError: (data) => {
-      const sn = data.shot_number as number
-      if (typeof sn === "number" && Number.isFinite(sn) && sn > 0) {
-        setFailedShots((prev) => new Set(prev).add(sn))
-        return
-      }
-      setJob((prev) => prev ? { ...prev, status: "failed", error_message: data.error as string } : null)
-    },
-    onDone: () => {
-      if (!jobId) return
-      getJobProgress(jobId, { includeShots: true, shotLimit: Math.max(SHOT_PAGE_SIZE, job?.shots.length || 0) })
+  const stopJob = async () => {
+    if (!jobId || cancelSubmitting) return
+    setCancelSubmitting(true)
+    setError("")
+    try {
+      const result = await cancelJob(jobId)
+      setJob((prev) => prev ? {
+        ...prev,
+        status: result.status,
+        error_message: result.status === "failed" ? "Cancelled by user" : prev.error_message,
+      } : prev)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "取消失败")
+      getJobProgress(jobId, { includeShots: true, shotLimit: SHOT_PAGE_SIZE })
         .then(setJob)
-        .catch((e) => setError(e instanceof Error ? e.message : "加载失败"))
+        .catch(() => undefined)
+    } finally {
+      setCancelSubmitting(false)
+    }
+  }
+
+  useSSE(
+    job?.status === "preprocessing" || job?.status === "preprocessing_done" || job?.status === "analyzing" || job?.status === "cancelling"
+      ? (jobId ?? null)
+      : null,
+    {
+      onStatus: (data) => {
+        setPreprocessMsg(data.message as string)
+        setPreprocessStep(data.step as string)
+        if (data.message === "Analyzing..." || data.phase === "analyzing") {
+          setJob((prev) => prev ? { ...prev, status: "analyzing" } : null)
+        } else if (data.phase === "cancelling") {
+          setJob((prev) => prev ? { ...prev, status: "cancelling" } : null)
+        }
+      },
+      onShotStart: () => {},
+      onShotDone: (data) => {
+        const sn = data.shot_number as number
+        if (typeof sn !== "number" || !Number.isFinite(sn) || sn < 1) return
+        setCompletedShots((prev) => new Set(prev).add(sn))
+      },
+      onThinking: (data) => { queueThinkingUpdate(data.text as string) },
+      onComplete: () => {
+        if (!jobId) return
+        getJobProgress(jobId, { includeShots: true, shotLimit: Math.max(SHOT_PAGE_SIZE, job?.shots.length || 0) })
+          .then(setJob)
+          .catch((e) => setError(e instanceof Error ? e.message : "加载失败"))
+      },
+      onOverviewFailed: (data) => {
+        setJob((prev) => prev ? { ...prev, error_message: data.error as string } : null)
+      },
+      onError: (data) => {
+        const sn = data.shot_number as number
+        if (typeof sn === "number" && Number.isFinite(sn) && sn > 0) {
+          setFailedShots((prev) => new Set(prev).add(sn))
+          return
+        }
+        setJob((prev) => prev ? { ...prev, status: "failed", error_message: data.error as string } : null)
+      },
+      onDone: () => {
+        if (!jobId) return
+        getJobProgress(jobId, { includeShots: true, shotLimit: Math.max(SHOT_PAGE_SIZE, job?.shots.length || 0) })
+          .then(setJob)
+          .catch((e) => setError(e instanceof Error ? e.message : "加载失败"))
+      },
     },
-  })
+  )
 
   const savedCompletedShots = useMemo(
     () => new Set(job?.shots.filter((shot) => shot.status === "completed").map((shot) => shot.shot_number) || []),
@@ -193,11 +237,13 @@ export default function ProgressPage() {
   }
 
   const getConclusion = () => {
+    if (job?.status === "failed" && /cancel|取消/i.test(job.error_message || "")) return "分析已取消，现有素材已安全保留。"
     if (error || job?.error_message) return `分析遇到问题: ${error || job?.error_message}`
     if (job?.status === "partial_completed") return "部分镜头已完成，报告可先查看；未完成镜头可稍后重试。"
     if (job?.status === "completed") return "分析已完成，报告已生成。"
     if (job?.status === "analyzing") return `正在深入分析镜头内容... (${completedCount}/${totalShots || "?"})`
     if (job?.status === "preprocessing") return `正在准备视频资源: ${preprocessMsg || "加载中"}`
+    if (job?.status === "cancelling") return "正在安全停止当前分析任务..."
     return "正在排队，请稍候。"
   }
 
@@ -209,6 +255,15 @@ export default function ProgressPage() {
         conclusion={getConclusion()}
         primaryAction={
           <div className="flex items-center gap-2">
+            {(job?.status === "preprocessing" || job?.status === "preprocessing_done" || job?.status === "analyzing" || job?.status === "cancelling") && (
+              <button
+                onClick={stopJob}
+                disabled={cancelSubmitting || job?.status === "cancelling"}
+                className="px-4 py-2 rounded-lg border border-clay/25 text-clay text-sm hover:bg-clay/5 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {cancelSubmitting || job?.status === "cancelling" ? "取消中" : "取消分析"}
+              </button>
+            )}
             {(job?.status === "failed" || job?.status === "partial_completed") && (
               <button
                 onClick={retryJob}
@@ -228,7 +283,7 @@ export default function ProgressPage() {
           </div>
         }
       >
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-[10px] text-muted font-bold tracking-wider uppercase">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs text-muted font-bold tracking-normal uppercase">
           <ProgressMetric label="当前阶段" value={runningLabel} />
           <ProgressMetric label="已完成" value={totalShots ? `${completedCount}/${totalShots}` : `${progressPct}%`} />
           <ProgressMetric label="失败镜头" value={`${failedCount}`} tone={failedCount > 0 ? "text-clay" : undefined} />
@@ -244,7 +299,7 @@ export default function ProgressPage() {
 
         {/* Preprocessing Stepper */}
         {(job?.status === "preprocessing" || job?.status === "preprocessing_done") && (
-          <div className="mt-2 flex items-center gap-4 text-[10px] text-muted/60">
+          <div className="mt-2 flex items-center gap-4 text-xs text-muted">
             <ProgressDot label="检测" done={preprocessStep !== "shot_detection" && preprocessStep !== ""} active={preprocessStep === "shot_detection"} />
             <ProgressDot label="音频" done={["frame_extraction", "transcription"].includes(preprocessStep) || job?.status === "preprocessing_done"} active={preprocessStep === "audio_analysis"} />
             <ProgressDot label="抽帧" done={preprocessStep === "transcription" || job?.status === "preprocessing_done"} active={preprocessStep === "frame_extraction"} />
@@ -254,7 +309,7 @@ export default function ProgressPage() {
 
         {/* Analyzing Log */}
         {job?.status === "analyzing" && thinking && (
-          <div className="mt-2 text-[10px] text-muted/50 italic font-serif truncate">
+          <div className="mt-2 text-xs text-muted italic font-serif truncate">
             {thinking}
           </div>
         )}
@@ -264,8 +319,8 @@ export default function ProgressPage() {
       {job?.shots && job.shots.length > 0 && (
         <div className="mt-8 space-y-4">
           <div className="flex items-center justify-between px-1">
-            <h3 className="text-xs font-medium text-muted/80 tracking-wider uppercase">分析详情</h3>
-            <span className="text-[10px] text-muted/40">{job.shots.length} / {totalShots || job.shots.length}</span>
+            <h3 className="text-xs font-medium text-muted tracking-normal uppercase">分析详情</h3>
+            <span className="text-xs text-muted">{job.shots.length} / {totalShots || job.shots.length}</span>
           </div>
           <div className="space-y-1">
             {job.shots.map((shot) => (
@@ -279,7 +334,7 @@ export default function ProgressPage() {
               <button
                 onClick={loadMoreShots}
                 disabled={loadingMoreShots}
-                className="px-3 py-1.5 text-[10px] font-bold text-primary/60 hover:text-primary disabled:text-muted/25 transition-colors uppercase tracking-widest"
+                className="px-3 py-1.5 text-xs font-bold text-primary/60 hover:text-primary disabled:text-muted transition-colors uppercase tracking-normal"
               >
                 {loadingMoreShots ? "正在加载" : "加载更多镜头"}
               </button>
@@ -294,7 +349,7 @@ export default function ProgressPage() {
 function ProgressMetric({ label, value, tone = "text-ink" }: { label: string; value: string; tone?: string }) {
   return (
     <div className="min-w-0">
-      <div className="text-muted/30 mb-1">{label}</div>
+      <div className="text-muted mb-1">{label}</div>
       <div className={`text-sm normal-case tracking-normal truncate ${tone}`}>{value}</div>
     </div>
   )
@@ -304,7 +359,7 @@ function ProgressDot({ label, active, done }: { label: string; active: boolean; 
   return (
     <div className="flex items-center gap-1.5">
       <div className={`w-1.5 h-1.5 rounded-full ${done ? "bg-sage" : active ? "bg-primary animate-pulse" : "bg-line"}`} />
-      <span className={done ? "text-muted" : active ? "text-ink" : "text-muted/40"}>{label}</span>
+      <span className={done ? "text-muted" : active ? "text-ink" : "text-muted"}>{label}</span>
     </div>
   )
 }

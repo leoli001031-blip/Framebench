@@ -19,7 +19,7 @@ const statusConfig: Record<StatusType, { bg: string; text: string; label: string
 export default function StatusBean({ type, label }: Props) {
   const config = statusConfig[type] || statusConfig.pending
   return (
-    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium leading-none ${config.bg} ${config.text}`}>
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium leading-none ${config.bg} ${config.text}`}>
       {label || config.label}
     </span>
   )

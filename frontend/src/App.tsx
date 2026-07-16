@@ -12,7 +12,7 @@ function NotFound() {
   return (
     <div className="flex flex-col items-center justify-center py-48 text-center">
       <p className="text-6xl font-serif font-light text-ink/10 mb-4">404</p>
-      <p className="text-sm text-muted/40 font-serif italic">页面不存在</p>
+      <p className="text-sm text-muted font-serif italic">页面不存在</p>
     </div>
   )
 }

@@ -1,4 +1,6 @@
 import os
+import logging
+import re
 import secrets
 from contextlib import asynccontextmanager
 from fastapi import Request
@@ -11,6 +13,55 @@ from backend.config import JOBS_DIR, LOCAL_API_TOKEN, ensure_data_root
 
 
 INTERRUPTED_JOB_MESSAGE = "上一次分析在应用或后端退出时中断，请重新分析。若反复出现，请发送本机日志。"
+CURRENT_SCHEMA_VERSION = 2
+
+
+_LOG_SECRET_PATTERNS = (
+    (re.compile(r"([?&]token=)[^&\s]+"), r"\1[REDACTED]"),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"(X-(?:Framebench|Film-Master)-Token:\s*)\S+", re.IGNORECASE), r"\1[REDACTED]"),
+)
+
+
+def _redact_log_value(value):
+    if not isinstance(value, str):
+        return value
+    for pattern, replacement in _LOG_SECRET_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
+class _SecretRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_log_value(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact_log_value(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {key: _redact_log_value(value) for key, value in record.args.items()}
+        return True
+
+
+def _install_log_redaction():
+    for logger_name in ("uvicorn.access", "uvicorn.error"):
+        logger = logging.getLogger(logger_name)
+        if not any(isinstance(f, _SecretRedactionFilter) for f in logger.filters):
+            logger.addFilter(_SecretRedactionFilter())
+
+
+_install_log_redaction()
+
+
+async def _migrate_schema_v2(conn):
+    from sqlalchemy import text
+
+    for table_name in ("storyboards", "storyboard_generation_tasks"):
+        columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+        column_names = {row[1] for row in columns.fetchall()}
+        if "reference_shot_ids" not in column_names:
+            await conn.execute(text(
+                f"ALTER TABLE {table_name} "
+                "ADD COLUMN reference_shot_ids TEXT NOT NULL DEFAULT '[]'"
+            ))
 
 
 @asynccontextmanager
@@ -21,7 +72,20 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        from sqlalchemy import text
+        from sqlalchemy import bindparam, text
+        await conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS schema_version ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "version INTEGER NOT NULL, "
+            "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+        ))
+        await conn.execute(text(
+            "INSERT OR IGNORE INTO schema_version (id, version, updated_at) "
+            "VALUES (1, 0, CURRENT_TIMESTAMP)"
+        ))
+        version_result = await conn.execute(text("SELECT version FROM schema_version WHERE id = 1"))
+        schema_version = int(version_result.scalar_one_or_none() or 0)
+
         for statement in (
             "CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
@@ -31,19 +95,50 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_storyboard_shots_storyboard_id ON storyboard_shots(storyboard_id)",
             "CREATE INDEX IF NOT EXISTS idx_storyboard_shots_storyboard_number ON storyboard_shots(storyboard_id, shot_number)",
             "CREATE INDEX IF NOT EXISTS idx_storyboard_generation_tasks_created_at ON storyboard_generation_tasks(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_reference_board_created_at ON reference_board_items(created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_dimensions_shot_id ON dimensions(shot_id)",
             "CREATE INDEX IF NOT EXISTS idx_transcript_segments_job_id ON transcript_segments(job_id)",
         ):
             await conn.execute(text(statement))
 
-        from backend.config import MOONSHOT_API_KEY, MOONSHOT_MODEL, MOONSHOT_BASE_URL
+        if schema_version < 1:
+            storyboard_columns = await conn.execute(text("PRAGMA table_info(storyboard_shots)"))
+            storyboard_column_names = {row[1] for row in storyboard_columns.fetchall()}
+            if "image_url" not in storyboard_column_names:
+                await conn.execute(text("ALTER TABLE storyboard_shots ADD COLUMN image_url TEXT"))
+            if "image_status" not in storyboard_column_names:
+                await conn.execute(text("ALTER TABLE storyboard_shots ADD COLUMN image_status TEXT"))
+            if "image_error" not in storyboard_column_names:
+                await conn.execute(text("ALTER TABLE storyboard_shots ADD COLUMN image_error TEXT"))
+            if "image_updated_at" not in storyboard_column_names:
+                await conn.execute(text("ALTER TABLE storyboard_shots ADD COLUMN image_updated_at DATETIME"))
+
+            job_columns = await conn.execute(text("PRAGMA table_info(jobs)"))
+            job_column_names = {row[1] for row in job_columns.fetchall()}
+            if "deleted_at" not in job_column_names:
+                await conn.execute(text("ALTER TABLE jobs ADD COLUMN deleted_at DATETIME"))
+
+        if schema_version < 2:
+            await _migrate_schema_v2(conn)
+
+        from backend.config import (
+            STEPFUN_API_KEY,
+            STEPFUN_BASE_URL,
+            STEPFUN_IMAGE_BASE_URL,
+            STEPFUN_IMAGE_MODEL,
+            STEPFUN_TEXT_MODEL,
+        )
         defaults = [
-            ("analysis_api_key", MOONSHOT_API_KEY, "分析引擎 API 密钥"),
-            ("analysis_model", MOONSHOT_MODEL, "分析引擎模型名称"),
-            ("analysis_base_url", MOONSHOT_BASE_URL, "分析引擎接口地址"),
-            ("storyboard_api_key", MOONSHOT_API_KEY, "分镜引擎 API 密钥"),
-            ("storyboard_model", MOONSHOT_MODEL, "分镜引擎模型名称"),
-            ("storyboard_base_url", MOONSHOT_BASE_URL, "分镜引擎接口地址"),
+            ("analysis_api_key", STEPFUN_API_KEY, "分析引擎 API 密钥"),
+            ("analysis_model", STEPFUN_TEXT_MODEL, "分析引擎模型名称"),
+            ("analysis_base_url", STEPFUN_BASE_URL, "分析引擎接口地址"),
+            ("storyboard_api_key", STEPFUN_API_KEY, "分镜引擎 API 密钥"),
+            ("storyboard_model", STEPFUN_TEXT_MODEL, "分镜引擎模型名称"),
+            ("storyboard_base_url", STEPFUN_BASE_URL, "分镜引擎接口地址"),
+            ("image_api_key", STEPFUN_API_KEY, "分镜图生成 API 密钥"),
+            ("image_model", STEPFUN_IMAGE_MODEL, "分镜图生成模型名称"),
+            ("image_base_url", STEPFUN_IMAGE_BASE_URL, "分镜图生成接口地址"),
+            ("whisper_model", "base", "本地 Whisper 转写模型"),
         ]
         for key, value, description in defaults:
             await conn.execute(
@@ -53,6 +148,46 @@ async def lifespan(app: FastAPI):
                 ),
                 {"key": key, "value": value, "description": description},
             )
+        legacy_setting_updates = [
+            ("analysis_model", STEPFUN_TEXT_MODEL, ("", "kimi-k2.6")),
+            ("storyboard_model", STEPFUN_TEXT_MODEL, ("", "kimi-k2.6", "deepseek-v4-pro")),
+            ("analysis_base_url", STEPFUN_BASE_URL, ("", "https://api.moonshot.cn/v1")),
+            (
+                "storyboard_base_url",
+                STEPFUN_BASE_URL,
+                ("", "https://api.moonshot.cn/v1", "https://api.deepseek.com/v1"),
+            ),
+        ]
+        for key, value, legacy_values in legacy_setting_updates:
+            await conn.execute(
+                text(
+                    "UPDATE system_settings SET value = :value, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE key = :key AND (value IS NULL OR value IN :legacy_values)"
+                ).bindparams(bindparam("legacy_values", expanding=True)),
+                {"key": key, "value": value, "legacy_values": legacy_values},
+            )
+        from backend.config import SECRET_SETTING_KEYS
+        from backend.services.secret_store import KEYCHAIN_MARKER, store_secret_value
+        for key in SECRET_SETTING_KEYS:
+            result = await conn.execute(
+                text("SELECT value FROM system_settings WHERE key = :key"),
+                {"key": key},
+            )
+            value = result.scalar_one_or_none()
+            if value and value != KEYCHAIN_MARKER:
+                stored_value = store_secret_value(key, value)
+                if stored_value != value:
+                    await conn.execute(
+                        text(
+                            "UPDATE system_settings SET value = :value, updated_at = CURRENT_TIMESTAMP "
+                            "WHERE key = :key"
+                        ),
+                        {"key": key, "value": stored_value},
+                    )
+        await conn.execute(
+            text("UPDATE schema_version SET version = :version, updated_at = CURRENT_TIMESTAMP WHERE id = 1"),
+            {"version": max(schema_version, CURRENT_SCHEMA_VERSION)},
+        )
 
     # Reset any stuck jobs (analyzing/preprocessing -> failed)
     from backend.models import Job, StoryboardGenerationTask, _now

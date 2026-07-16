@@ -19,7 +19,7 @@ export default function CategoryInput({ category, onSave, className = "" }: Prop
     <input
       value={value}
       onChange={(e) => setValue(e.target.value)}
-      className={`px-2 py-1 text-[10px] bg-white border border-line rounded focus:outline-none focus:border-primary ${className}`}
+      className={`px-2 py-1 text-xs bg-white border border-line rounded focus:outline-none focus:border-primary ${className}`}
       onKeyDown={(e) => {
         if (e.key === "Enter") save()
         if (e.key === "Escape") setEditing(false)
@@ -29,7 +29,7 @@ export default function CategoryInput({ category, onSave, className = "" }: Prop
   ) : (
     <button
       onClick={() => { setEditing(true); setValue(category) }}
-      className="text-[10px] text-muted/30 hover:text-ink transition-colors font-bold uppercase tracking-widest"
+      className="text-xs text-muted hover:text-ink transition-colors font-bold uppercase tracking-normal"
     >
       {category || "分类"}
     </button>

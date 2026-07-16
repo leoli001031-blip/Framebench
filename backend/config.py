@@ -13,26 +13,31 @@ def _env(primary_name: str, legacy_name: str, default: str = "") -> str:
 
 # Allow overriding data directory via env (for Electron persistent user data)
 _DATA_ROOT = _env("FRAMEBENCH_DATA_DIR", "FILM_MASTER_DATA_DIR", BASE_DIR)
+DATA_ROOT = _DATA_ROOT
 DATA_DIR = os.path.join(_DATA_ROOT, "data")
 JOBS_DIR = os.path.join(DATA_DIR, "jobs")
 DB_PATH = os.path.join(_DATA_ROOT, "film_master.db")
 LOCAL_API_TOKEN = _env("FRAMEBENCH_LOCAL_TOKEN", "FILM_MASTER_LOCAL_TOKEN")
 FFMPEG_BIN = _env("FRAMEBENCH_FFMPEG_BIN", "FILM_MASTER_FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = _env("FRAMEBENCH_FFPROBE_BIN", "FILM_MASTER_FFPROBE_BIN", "ffprobe")
-MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
-MOONSHOT_MODEL = "kimi-k2.6"
-MOONSHOT_BASE_URL = "https://api.moonshot.cn/v1"
+STEPFUN_API_KEY = os.getenv("STEPFUN_API_KEY", "")
+STEPFUN_TEXT_MODEL = "step-3.7-flash"
+STEPFUN_BASE_URL = "https://api.stepfun.com/v1"
+STEPFUN_IMAGE_MODEL = "step-image-edit-2"
+STEPFUN_IMAGE_BASE_URL = "https://api.stepfun.com/v1"
 MAX_VIDEO_SIZE_MB = 2048
 MAX_SHOTS = 300
-BATCH_SIZE = 10  # Concurrent shots per batch (Moonshot Tier1: 50 concurrency)
+BATCH_SIZE = 10
 ANALYSIS_CONCURRENCY = int(_env("FRAMEBENCH_ANALYSIS_CONCURRENCY", "FILM_MASTER_ANALYSIS_CONCURRENCY", str(BATCH_SIZE)))
 ANALYSIS_IMAGE_MAX_SIDE = int(_env("FRAMEBENCH_ANALYSIS_IMAGE_MAX_SIDE", "FILM_MASTER_ANALYSIS_IMAGE_MAX_SIDE", "1024"))
 ANALYSIS_IMAGE_JPEG_QUALITY = int(_env("FRAMEBENCH_ANALYSIS_IMAGE_JPEG_QUALITY", "FILM_MASTER_ANALYSIS_IMAGE_JPEG_QUALITY", "82"))
 UI_FRAME_MAX_SIDE = int(_env("FRAMEBENCH_UI_FRAME_MAX_SIDE", "FILM_MASTER_UI_FRAME_MAX_SIDE", "480"))
 UI_FRAME_JPEG_QUALITY = int(_env("FRAMEBENCH_UI_FRAME_JPEG_QUALITY", "FILM_MASTER_UI_FRAME_JPEG_QUALITY", "78"))
 FRAME_EXTRACTION_CONCURRENCY = int(_env("FRAMEBENCH_FRAME_EXTRACTION_CONCURRENCY", "FILM_MASTER_FRAME_EXTRACTION_CONCURRENCY", "3"))
+PREPROCESS_JOB_CONCURRENCY = int(_env("FRAMEBENCH_PREPROCESS_JOB_CONCURRENCY", "FILM_MASTER_PREPROCESS_JOB_CONCURRENCY", "1"))
+STORYBOARD_GENERATION_CONCURRENCY = int(_env("FRAMEBENCH_STORYBOARD_GENERATION_CONCURRENCY", "FILM_MASTER_STORYBOARD_GENERATION_CONCURRENCY", "1"))
 JOB_DIR_PREFIX = os.path.join(JOBS_DIR, "")
-SECRET_SETTING_KEYS = ("analysis_api_key", "storyboard_api_key", "moonshot_api_key")
+SECRET_SETTING_KEYS = ("analysis_api_key", "storyboard_api_key", "image_api_key", "moonshot_api_key")
 
 
 def _sqlite_count(conn, table: str, where: str = "", params: tuple = ()) -> int:
@@ -93,6 +98,10 @@ def _legacy_data_roots() -> list[str]:
         seen.add(abs_root)
         unique_roots.append(root)
     return unique_roots
+
+
+def known_data_roots() -> list[str]:
+    return [os.path.abspath(_DATA_ROOT), *[os.path.abspath(root) for root in _legacy_data_roots()]]
 
 
 def _db_candidates_for_root(root: str) -> list[str]:
